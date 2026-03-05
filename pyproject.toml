@@ -1,0 +1,19 @@
+[project]
+name = "vtuber"
+version = "0.1.0"
+description = "A digital life agent powered by Claude Agent SDK"
+readme = "README.md"
+authors = [
+    { name = "FrostMiKu", email = "i@frostmiku.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.45",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[project.scripts]
+vtuber = "vtuber.main:cli"
