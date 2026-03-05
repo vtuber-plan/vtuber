@@ -19,13 +19,14 @@ from claude_agent_sdk.types import (
 
 from vtuber.daemon.protocol import decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.persona import Persona
+from vtuber.persona import build_system_prompt
 from vtuber.config import (
     ensure_config_dir,
     get_socket_path,
     get_pid_path,
     get_db_path,
     get_persona_path,
+    get_user_path,
 )
 from vtuber.tools.schedule import set_scheduler
 
@@ -153,12 +154,13 @@ class DaemonServer:
         # Create a temporary subagent with independent context
         try:
             persona_path = get_persona_path()
-            persona = Persona.from_markdown(persona_path)
+            user_path = get_user_path()
+            system_prompt = build_system_prompt(persona_path, user_path)
 
             # Create subagent with memory tools only
             tools_server, allowed_tools = _create_tools_server(include_schedule=False)
             options = ClaudeAgentOptions(
-                system_prompt=f"{persona.to_system_prompt()}\n\nYou are executing a scheduled task. Respond concisely.",
+                system_prompt=f"{system_prompt}\n\nYou are executing a scheduled task. Respond concisely.",
                 mcp_servers={"vtuber-tools": tools_server},
                 allowed_tools=allowed_tools,
                 permission_mode="bypassPermissions",
@@ -218,10 +220,8 @@ class DaemonServer:
             await self._broadcast(error_msg)
 
     async def _initialize_agent(self):
-        """Initialize the main Claude SDK client with persona."""
-        persona_path = get_persona_path()
-        persona = Persona.from_markdown(persona_path)
-        system_prompt = persona.to_system_prompt()
+        """Initialize the main Claude SDK client with persona and user profile."""
+        system_prompt = build_system_prompt(get_persona_path(), get_user_path())
 
         # Create SDK MCP server with all tools
         tools_server, allowed_tools = _create_tools_server(include_schedule=True)

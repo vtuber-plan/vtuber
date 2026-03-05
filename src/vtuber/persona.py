@@ -1,64 +1,37 @@
-"""Persona system - customizable personality for the digital life agent."""
+"""Persona system - build system prompt from persona.md and user.md."""
 
-from dataclasses import dataclass, field
 from pathlib import Path
-import re
+
+from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
+
+TOOLS_SECTION = """## 内置能力
+
+你拥有以下工具：
+- **记忆** (memorize/recall/forget): 你可以记住和回忆跨对话的持久记忆
+- **日程** (schedule_create/schedule_list/schedule_cancel): 你可以创建定时提醒
+- **心跳** (heartbeat): 你可以记录你的活动状态
+
+请自然地使用这些工具来增强你的交互体验。"""
 
 
-@dataclass
-class Persona:
-    """Defines the agent's personality and behavior."""
+def _read_or_default(path: Path, default: str) -> str:
+    """Read file content, falling back to default if missing or empty."""
+    if path.exists():
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            return content
+    return default.strip()
 
-    name: str = "VTuber"
-    description: str = "A friendly digital life companion."
-    traits: list[str] = field(default_factory=lambda: ["friendly", "curious", "helpful"])
-    speaking_style: str = "casual and warm"
-    language: str = "zh-CN"
 
-    @classmethod
-    def from_markdown(cls, path: Path) -> "Persona":
-        """Load persona from markdown file."""
-        if not path.exists():
-            return cls()
+def build_system_prompt(persona_path: Path, user_path: Path) -> str:
+    """Build system prompt from persona.md and user.md files."""
+    persona_content = _read_or_default(persona_path, DEFAULT_PERSONA)
+    user_content = _read_or_default(user_path, DEFAULT_USER)
 
-        content = path.read_text(encoding="utf-8")
-
-        # Parse basic info
-        name_match = re.search(r"- Name:\s*(.+)", content)
-        desc_match = re.search(r"- Description:\s*(.+)", content)
-
-        # Parse traits
-        traits = []
-        traits_match = re.search(r"## Personality Traits\n(.*?)(?=\n##|$)", content, re.DOTALL)
-        if traits_match:
-            traits = re.findall(r"-\s*(.+)", traits_match.group(1))
-
-        # Parse speaking style
-        style = "casual and warm"
-        style_match = re.search(r"## Speaking Style\n(.*?)(?=\n##|$)", content, re.DOTALL)
-        if style_match:
-            styles = re.findall(r"-\s*(.+)", style_match.group(1))
-            if styles:
-                style = " and ".join(styles)
-
-        return cls(
-            name=name_match.group(1).strip() if name_match else "VTuber",
-            description=desc_match.group(1).strip() if desc_match else "",
-            traits=traits if traits else ["friendly", "curious", "helpful"],
-            speaking_style=style,
-        )
-
-    def to_system_prompt(self) -> str:
-        traits_str = "、".join(self.traits)
-        return (
-            f"你是 {self.name}，{self.description}\n\n"
-            f"## 性格特点\n{traits_str}\n\n"
-            f"## 说话风格\n{self.speaking_style}\n\n"
-            f"## 语言\n使用 {self.language} 进行交流。\n\n"
-            f"## 内置能力\n"
-            f"你拥有以下工具：\n"
-            f"- **记忆** (memorize/recall/forget): 你可以记住和回忆跨对话的持久记忆\n"
-            f"- **日程** (schedule_create/schedule_list/schedule_cancel): 你可以创建定时提醒\n"
-            f"- **心跳** (heartbeat): 你可以记录你的活动状态\n\n"
-            f"请自然地使用这些工具来增强你的交互体验。"
-        )
+    return (
+        f"{persona_content}\n\n"
+        f"---\n\n"
+        f"{user_content}\n\n"
+        f"---\n\n"
+        f"{TOOLS_SECTION}"
+    )
