@@ -1,6 +1,8 @@
 """Persona system - customizable personality for the digital life agent."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import re
 
 
 @dataclass
@@ -12,6 +14,39 @@ class Persona:
     traits: list[str] = field(default_factory=lambda: ["friendly", "curious", "helpful"])
     speaking_style: str = "casual and warm"
     language: str = "zh-CN"
+
+    @classmethod
+    def from_markdown(cls, path: Path) -> "Persona":
+        """Load persona from markdown file."""
+        if not path.exists():
+            return cls()
+
+        content = path.read_text(encoding="utf-8")
+
+        # Parse basic info
+        name_match = re.search(r"- Name:\s*(.+)", content)
+        desc_match = re.search(r"- Description:\s*(.+)", content)
+
+        # Parse traits
+        traits = []
+        traits_match = re.search(r"## Personality Traits\n(.*?)(?=\n##|$)", content, re.DOTALL)
+        if traits_match:
+            traits = re.findall(r"-\s*(.+)", traits_match.group(1))
+
+        # Parse speaking style
+        style = "casual and warm"
+        style_match = re.search(r"## Speaking Style\n(.*?)(?=\n##|$)", content, re.DOTALL)
+        if style_match:
+            styles = re.findall(r"-\s*(.+)", style_match.group(1))
+            if styles:
+                style = " and ".join(styles)
+
+        return cls(
+            name=name_match.group(1).strip() if name_match else "VTuber",
+            description=desc_match.group(1).strip() if desc_match else "",
+            traits=traits if traits else ["friendly", "curious", "helpful"],
+            speaking_style=style,
+        )
 
     def to_system_prompt(self) -> str:
         traits_str = "、".join(self.traits)
