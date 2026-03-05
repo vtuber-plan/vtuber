@@ -1,6 +1,5 @@
 """Onboarding flow for first-time users."""
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -19,28 +18,31 @@ from claude_agent_sdk.types import (
 from vtuber.config import ensure_config_dir, get_persona_path, get_user_path
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
 
-# Onboarding 允许 AI 读写的文件白名单
-ALLOWED_FILES = {
-    str(get_persona_path()),
-    str(get_user_path()),
-}
+def _get_allowed_files() -> set[str]:
+    """Compute allowed file paths at call time (not import time)."""
+    return {
+        str(get_persona_path().resolve()),
+        str(get_user_path().resolve()),
+    }
 
 
 async def _onboarding_permission(
     tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
 ) -> PermissionResultAllow | PermissionResultDeny:
     """Restrict AI to only read/write persona.md and user.md."""
+    allowed = _get_allowed_files()
     if tool_name in ("Write", "Edit", "MultiEdit"):
-        file_path = tool_input.get("file_path", "")
-        if file_path not in ALLOWED_FILES:
+        file_path = str(Path(tool_input.get("file_path", "")).resolve())
+        if file_path not in allowed:
             return PermissionResultDeny(message="Onboarding 只允许写入 persona.md 和 user.md")
         return PermissionResultAllow()
     if tool_name == "Read":
-        file_path = tool_input.get("file_path", "")
-        if file_path not in ALLOWED_FILES:
+        file_path = str(Path(tool_input.get("file_path", "")).resolve())
+        if file_path not in allowed:
             return PermissionResultDeny(message="Onboarding 只允许读取 persona.md 和 user.md")
         return PermissionResultAllow()
-    return PermissionResultAllow()
+    # Default deny for any other tool
+    return PermissionResultDeny(message=f"Onboarding 不允许使用 {tool_name} 工具")
 
 
 def _extract_stream_text(msg) -> str | None:
@@ -137,9 +139,13 @@ async def _run_phase(
     # Send to AI with instruction
     await _query_and_collect(agent, ai_instruction + user_input)
 
-    # Confirm/revise loop — exit when file is written
+    # Confirm/revise loop — exit when file is written or user quits
     while not target_path.exists():
-        user_reply = input("\n> ")
+        try:
+            user_reply = input("\n> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n跳过此阶段，使用默认配置。")
+            return
         await _query_and_collect(agent, user_reply)
 
     print(f"\n✓ {phase_name} 已保存到 {target_path}")
