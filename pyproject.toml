@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.45",
     "apscheduler>=3.10.0",
+    "sqlalchemy>=2.0.0",
 ]
 
 [build-system]
