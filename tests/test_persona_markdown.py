@@ -1,42 +1,26 @@
-import pytest
+"""Tests for persona system prompt building."""
+
 from pathlib import Path
-from vtuber.persona import Persona
+from vtuber.persona import build_system_prompt
 
 
-def test_load_from_markdown(tmp_path):
-    persona_file = tmp_path / "persona.md"
-    persona_file.write_text("""# Persona Configuration
+def test_build_system_prompt_with_files(tmp_path: Path):
+    """Test building system prompt from actual files."""
+    persona = tmp_path / "persona.md"
+    user = tmp_path / "user.md"
+    persona.write_text("# Test Persona\n- Friendly")
+    user.write_text("# Test User\n- Name: Tester")
 
-## Basic Info
-- Name: TestAgent
-- Description: A test agent
-
-## Personality Traits
-- Friendly
-- Helpful
-
-## Speaking Style
-- Casual
-""")
-
-    persona = Persona.from_markdown(persona_file)
-    assert persona.name == "TestAgent"
-    assert "Friendly" in persona.traits
-    assert persona.description == "A test agent"
+    result = build_system_prompt(persona, user)
+    assert "Test Persona" in result
+    assert "Test User" in result
 
 
-def test_to_system_prompt_from_markdown(tmp_path):
-    persona_file = tmp_path / "persona.md"
-    persona_file.write_text("""# Persona Configuration
+def test_build_system_prompt_defaults(tmp_path: Path):
+    """Test building system prompt with missing files uses defaults."""
+    persona = tmp_path / "missing_persona.md"
+    user = tmp_path / "missing_user.md"
 
-## Basic Info
-- Name: TestAgent
-
-## Personality Traits
-- Friendly
-""")
-
-    persona = Persona.from_markdown(persona_file)
-    prompt = persona.to_system_prompt()
-    assert "TestAgent" in prompt
-    assert "Friendly" in prompt
+    result = build_system_prompt(persona, user)
+    assert "VTuber" in result  # Default persona name
+    assert "User" in result  # Default user name

@@ -1,11 +1,19 @@
 from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
-from vtuber.tools.memory import memorize, recall, forget
+from vtuber.tools.memory import (
+    search_sessions,
+    list_sessions,
+    update_long_term_memory,
+    log_message,
+    create_session_id,
+)
 
 __all__ = [
     "schedule_create",
     "schedule_list",
     "schedule_cancel",
-    "memorize",
-    "recall",
-    "forget",
+    "search_sessions",
+    "list_sessions",
+    "update_long_term_memory",
+    "log_message",
+    "create_session_id",
 ]

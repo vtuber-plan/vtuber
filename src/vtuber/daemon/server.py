@@ -10,11 +10,8 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk.types import (
-    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
-    StreamEvent,
-    TextBlock,
 )
 
 from vtuber.daemon.protocol import decode_message, encode_message
@@ -29,14 +26,16 @@ from vtuber.config import (
     get_user_path,
 )
 from vtuber.tools.schedule import set_scheduler
+from vtuber.tools.memory import log_message, create_session_id
+from vtuber.utils import extract_stream_text
 
 
 def _create_tools_server(include_schedule: bool = True):
     """Create an SDK MCP server with vtuber tools."""
-    from vtuber.tools.memory import memorize, recall, forget
+    from vtuber.tools.memory import search_sessions, list_sessions, update_long_term_memory
 
-    tools = [memorize, recall, forget]
-    allowed = ["memorize", "recall", "forget"]
+    tools = [search_sessions, list_sessions, update_long_term_memory]
+    allowed = ["search_sessions", "list_sessions", "update_long_term_memory"]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
@@ -46,26 +45,6 @@ def _create_tools_server(include_schedule: bool = True):
 
     server = create_sdk_mcp_server("vtuber-tools", tools=tools)
     return server, allowed
-
-
-def _extract_stream_text(msg) -> str | None:
-    """Extract text from a StreamEvent or AssistantMessage."""
-    if isinstance(msg, StreamEvent):
-        event = msg.event
-        if event.get("type") == "content_block_delta":
-            delta = event.get("delta", {})
-            if delta.get("type") == "text_delta":
-                return delta.get("text", "")
-        return None
-
-    if isinstance(msg, AssistantMessage):
-        parts = []
-        for block in msg.content:
-            if isinstance(block, TextBlock) and block.text:
-                parts.append(block.text)
-        return "".join(parts) if parts else None
-
-    return None
 
 
 class DaemonServer:
@@ -81,6 +60,7 @@ class DaemonServer:
         self._server: asyncio.Server | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self.heartbeat_interval: int = 5  # Minutes between heartbeats
+        self.session_id: str = create_session_id()
 
     async def start(self):
         """Start the daemon server."""
@@ -141,11 +121,15 @@ class DaemonServer:
 
     def _on_scheduled_task(self, event):
         """Handle scheduled task execution."""
-        if hasattr(event, "job_id") and hasattr(event, "kwargs"):
-            task_prompt = event.kwargs.get("task", "")
-            if task_prompt:
-                # Create async task to execute
-                asyncio.create_task(self._execute_scheduled_task(task_prompt))
+        if hasattr(event, "job_id"):
+            try:
+                job = self.scheduler.scheduler.get_job(event.job_id)
+                if job and job.kwargs:
+                    task_prompt = job.kwargs.get("task", "")
+                    if task_prompt:
+                        asyncio.create_task(self._execute_scheduled_task(task_prompt))
+            except Exception:
+                pass
 
     async def _execute_scheduled_task(self, task_prompt: str):
         """Execute a scheduled task using a temporary subagent."""
@@ -174,7 +158,7 @@ class DaemonServer:
 
             await subagent.query(f"[Scheduled Task] {task_prompt}")
             async for msg in subagent.receive_response():
-                text = _extract_stream_text(msg)
+                text = extract_stream_text(msg)
                 if text:
                     # Stream result to all clients
                     response = encode_message(
@@ -319,15 +303,20 @@ class DaemonServer:
             await writer.drain()
             return
 
+        # Log user message to session
+        log_message(self.session_id, "user", content)
+
         try:
             # Send message to agent
             stream_id = f"stream_{id(writer)}"
             index = 0
+            assistant_text = ""
 
             await self.agent.query(content)
             async for msg in self.agent.receive_response():
-                text = _extract_stream_text(msg)
+                text = extract_stream_text(msg)
                 if text:
+                    assistant_text += text
                     response = encode_message(
                         {
                             "type": "assistant_message",
@@ -353,6 +342,10 @@ class DaemonServer:
                         }
                     )
                     await self._broadcast(response)
+
+            # Log assistant response to session
+            if assistant_text.strip():
+                log_message(self.session_id, "assistant", assistant_text.strip())
 
         except Exception as e:
             print(f"Error handling message: {e}")
@@ -408,7 +401,7 @@ class DaemonServer:
 
             heartbeat_msg += "What would you like to do? You can:\n"
             heartbeat_msg += "- Check if there are any scheduled tasks (use schedule_list)\n"
-            heartbeat_msg += "- Recall any important memories (use recall)\n"
+            heartbeat_msg += "- Search past conversations for context (use search_sessions)\n"
             heartbeat_msg += "- Initiate a conversation with the user\n"
             heartbeat_msg += "- Or simply respond with 'HEARTBEAT_OK' if everything is fine."
 
@@ -419,7 +412,7 @@ class DaemonServer:
 
             await self.agent.query(heartbeat_msg)
             async for msg in self.agent.receive_response():
-                text = _extract_stream_text(msg)
+                text = extract_stream_text(msg)
                 if text:
                     collected_text += text
                     # Only broadcast if it's not just "HEARTBEAT_OK"

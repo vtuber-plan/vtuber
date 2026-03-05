@@ -12,18 +12,16 @@ from rich.rule import Rule
 
 from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import (
-    AssistantMessage,
     ClaudeAgentOptions,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
-    StreamEvent,
-    TextBlock,
     ToolPermissionContext,
 )
 
 from vtuber.config import ensure_config_dir, get_persona_path, get_user_path
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
+from vtuber.utils import extract_stream_text
 
 console = Console()
 prompt_session = PromptSession()
@@ -53,26 +51,6 @@ async def _onboarding_permission(
             return PermissionResultDeny(message="Onboarding 只允许读取 persona.md 和 user.md")
         return PermissionResultAllow()
     return PermissionResultDeny(message=f"Onboarding 不允许使用 {tool_name} 工具")
-
-
-def _extract_stream_text(msg) -> str | None:
-    """Extract text from a StreamEvent or AssistantMessage."""
-    if isinstance(msg, StreamEvent):
-        event = msg.event
-        if event.get("type") == "content_block_delta":
-            delta = event.get("delta", {})
-            if delta.get("type") == "text_delta":
-                return delta.get("text", "")
-        return None
-
-    if isinstance(msg, AssistantMessage):
-        parts = []
-        for block in msg.content:
-            if isinstance(block, TextBlock) and block.text:
-                parts.append(block.text)
-        return "".join(parts) if parts else None
-
-    return None
 
 
 ONBOARDING_SYSTEM_PROMPT = """你是 VTuber 数字生命助手的初次设置引导员。你的任务是帮助用户完成两个配置文件的设置。
@@ -121,7 +99,7 @@ async def _query_and_collect(
     await agent.query(prompt)
     collected = ""
     async for msg in agent.receive_response():
-        text = _extract_stream_text(msg)
+        text = extract_stream_text(msg)
         if text:
             collected += text
         elif isinstance(msg, ResultMessage):

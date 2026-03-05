@@ -10,10 +10,6 @@ from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.live import Live
-from rich.text import Text
-
 from vtuber.daemon.protocol import encode_message, decode_message
 from vtuber.config import get_socket_path, ensure_config_dir
 
@@ -30,7 +26,6 @@ class CLIClient:
         self.running = False
         self._stream_buffer = ""
         self._is_streaming = False
-        self._live: Live | None = None
 
         # Setup prompt with history
         history_path = ensure_config_dir() / "cli_history"

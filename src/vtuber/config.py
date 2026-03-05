@@ -42,3 +42,20 @@ def get_pid_path() -> Path:
 def get_db_path() -> Path:
     """Get the SQLite database file path."""
     return get_config_dir() / "vtuber.db"
+
+
+def get_sessions_dir() -> Path:
+    """Get the session logs directory path."""
+    return get_config_dir() / "memory" / "sessions"
+
+
+def get_long_term_memory_path() -> Path:
+    """Get the long-term memory markdown file path."""
+    return get_config_dir() / "long_term_memory.md"
+
+
+def ensure_sessions_dir() -> Path:
+    """Ensure the sessions directory exists and return its path."""
+    sessions_dir = get_sessions_dir()
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    return sessions_dir

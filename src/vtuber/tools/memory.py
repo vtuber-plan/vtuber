@@ -1,119 +1,181 @@
-"""Global memory tool - persistent key-value memory for the agent across conversations."""
+"""Memory system — short-term session logs + long-term persistent memory."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
-_MEMORY_DIR = Path.home() / ".vtuber" / "memory"
+from vtuber.config import get_sessions_dir, get_long_term_memory_path, ensure_sessions_dir
 
 
-def _ensure_memory_dir() -> None:
-    _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+# --- Helper functions (called by daemon, not tools) ---
+
+def create_session_id() -> str:
+    """Create a timestamp-based session ID."""
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def _memory_file() -> Path:
-    return _MEMORY_DIR / "global.json"
-
-
-def _load_memory() -> dict[str, Any]:
-    _ensure_memory_dir()
-    f = _memory_file()
-    if f.exists():
-        return json.loads(f.read_text(encoding="utf-8"))
-    return {}
-
-
-def _save_memory(data: dict[str, Any]) -> None:
-    _ensure_memory_dir()
-    _memory_file().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-@tool(
-    "memorize",
-    "Store a key-value pair in persistent global memory. Memory persists across conversations.",
-    {
-        "type": "object",
-        "properties": {
-            "key": {"type": "string", "description": "Memory key"},
-            "value": {"type": "string", "description": "Value to remember"},
-        },
-        "required": ["key", "value"],
-    },
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
-)
-async def memorize(args: dict[str, Any]) -> dict[str, Any]:
-    mem = _load_memory()
-    mem[args["key"]] = args["value"]
-    _save_memory(mem)
-    return {
-        "content": [
-            {"type": "text", "text": f"Memorized: {args['key']} = {args['value']}"}
-        ]
+def log_message(session_id: str, role: str, content: str) -> None:
+    """Append a message to the session log file."""
+    sessions_dir = ensure_sessions_dir()
+    log_file = sessions_dir / f"{session_id}.jsonl"
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "role": role,
+        "content": content,
     }
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+
+# --- Tools for the AI ---
 
 @tool(
-    "recall",
-    "Recall a value from persistent global memory by key, or list all memories if no key is given.",
+    "search_sessions",
+    "Search through past conversation session logs by keyword. Returns matching messages with timestamps and context.",
     {
         "type": "object",
         "properties": {
-            "key": {
+            "query": {
                 "type": "string",
-                "description": "Memory key to recall. Omit to list all memories.",
+                "description": "Search keyword or phrase to look for in conversation history",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default: 10)",
+            },
+        },
+        "required": ["query"],
+    },
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
+    """Search through session logs for matching messages."""
+    query = args["query"].lower()
+    limit = args.get("limit", 10)
+    sessions_dir = get_sessions_dir()
+
+    if not sessions_dir.exists():
+        return {"content": [{"type": "text", "text": "No session logs found."}]}
+
+    results = []
+    # Sort session files by name (newest first since names are timestamps)
+    session_files = sorted(sessions_dir.glob("*.jsonl"), reverse=True)
+
+    for session_file in session_files:
+        session_name = session_file.stem
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if query in entry.get("content", "").lower():
+                        results.append(
+                            f"[{session_name}] {entry['timestamp']} ({entry['role']}): {entry['content'][:200]}"
+                        )
+                        if len(results) >= limit:
+                            break
+        except (json.JSONDecodeError, KeyError):
+            continue
+        if len(results) >= limit:
+            break
+
+    if not results:
+        return {"content": [{"type": "text", "text": f"No matches found for '{args['query']}'."}]}
+
+    return {"content": [{"type": "text", "text": "\n\n".join(results)}]}
+
+
+@tool(
+    "list_sessions",
+    "List recent conversation sessions with dates and first message preview.",
+    {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of sessions to list (default: 10)",
             },
         },
         "required": [],
     },
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
-async def recall(args: dict[str, Any]) -> dict[str, Any]:
-    mem = _load_memory()
-    key = args.get("key")
+async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
+    """List recent conversation sessions."""
+    limit = args.get("limit", 10)
+    sessions_dir = get_sessions_dir()
 
-    if key is None:
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(mem, ensure_ascii=False) if mem else "No memories stored.",
-                }
-            ]
-        }
+    if not sessions_dir.exists():
+        return {"content": [{"type": "text", "text": "No session logs found."}]}
 
-    value = mem.get(key)
-    if value is None:
-        return {
-            "content": [{"type": "text", "text": f"No memory found for key: {key}"}]
-        }
-    return {"content": [{"type": "text", "text": f"{key} = {value}"}]}
+    session_files = sorted(sessions_dir.glob("*.jsonl"), reverse=True)[:limit]
+
+    if not session_files:
+        return {"content": [{"type": "text", "text": "No session logs found."}]}
+
+    lines = ["Recent sessions:"]
+    for session_file in session_files:
+        session_name = session_file.stem
+        first_user_msg = ""
+        msg_count = 0
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    msg_count += 1
+                    entry = json.loads(line)
+                    if not first_user_msg and entry.get("role") == "user":
+                        first_user_msg = entry.get("content", "")[:80]
+        except (json.JSONDecodeError, KeyError):
+            continue
+        preview = first_user_msg if first_user_msg else "(empty)"
+        lines.append(f"- {session_name} ({msg_count} messages): {preview}")
+
+    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
 
 @tool(
-    "forget",
-    "Remove a key from persistent global memory.",
+    "update_long_term_memory",
+    "Append an insight or important note to long-term memory. Use sparingly — only for consolidated, important patterns and facts worth remembering across all future sessions. This is NOT for recording conversations.",
     {
         "type": "object",
         "properties": {
-            "key": {"type": "string", "description": "Memory key to forget"},
+            "content": {
+                "type": "string",
+                "description": "The insight or note to remember permanently. Should be concise and self-contained.",
+            },
         },
-        "required": ["key"],
+        "required": ["content"],
     },
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
-async def forget(args: dict[str, Any]) -> dict[str, Any]:
-    mem = _load_memory()
-    if args["key"] in mem:
-        del mem[args["key"]]
-        _save_memory(mem)
-        return {
-            "content": [{"type": "text", "text": f"Forgot: {args['key']}"}]
-        }
+async def update_long_term_memory(args: dict[str, Any]) -> dict[str, Any]:
+    """Append to long-term memory file."""
+    content = args["content"]
+    memory_path = get_long_term_memory_path()
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"\n## {timestamp}\n\n{content}\n"
+
+    # Create file with header if it doesn't exist
+    if not memory_path.exists():
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        memory_path.write_text(
+            "# Long-term Memory\n\nThis file contains consolidated insights and important notes.\n" + entry,
+            encoding="utf-8",
+        )
+    else:
+        with open(memory_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+
     return {
-        "content": [
-            {"type": "text", "text": f"No memory found for key: {args['key']}"}
-        ]
+        "content": [{"type": "text", "text": f"Long-term memory updated: {content[:100]}..."}]
     }
