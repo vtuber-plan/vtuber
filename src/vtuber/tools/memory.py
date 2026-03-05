@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import tool
+from mcp.types import ToolAnnotations
 
 _MEMORY_DIR = Path.home() / ".vtuber" / "memory"
 
@@ -41,6 +42,7 @@ def _save_memory(data: dict[str, Any]) -> None:
         },
         "required": ["key", "value"],
     },
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
 async def memorize(args: dict[str, Any]) -> dict[str, Any]:
     mem = _load_memory()
@@ -66,6 +68,7 @@ async def memorize(args: dict[str, Any]) -> dict[str, Any]:
         },
         "required": [],
     },
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def recall(args: dict[str, Any]) -> dict[str, Any]:
     mem = _load_memory()
@@ -99,6 +102,7 @@ async def recall(args: dict[str, Any]) -> dict[str, Any]:
         },
         "required": ["key"],
     },
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
 )
 async def forget(args: dict[str, Any]) -> dict[str, Any]:
     mem = _load_memory()
