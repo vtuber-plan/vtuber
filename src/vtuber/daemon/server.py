@@ -226,9 +226,10 @@ class DaemonServer:
         # Create SDK MCP server with all tools
         tools_server, allowed_tools = _create_tools_server(include_schedule=True)
 
-        # Create agent with proper options
+        # Create agent with all Claude Code tools + custom vtuber tools
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
+            tools={"type": "preset", "preset": "claude_code"},
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",

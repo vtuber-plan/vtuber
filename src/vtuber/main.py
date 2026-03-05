@@ -1,14 +1,29 @@
 """Command-line entry point for vtuber."""
 
 import sys
-from pathlib import Path
+
+from rich.console import Console
+
+console = Console()
+
+USAGE = """\
+[bold]VTuber[/bold] — 数字生命助手
+
+[bold]用法：[/bold] vtuber <command>
+
+[bold]命令：[/bold]
+  [green]start[/green]     启动 daemon（后台运行）
+  [green]stop[/green]      停止 daemon
+  [green]status[/green]    查看 daemon 状态
+  [green]chat[/green]      连接 daemon 开始对话
+  [green]restart[/green]   重启 daemon
+"""
 
 
 def main():
     """Main command router."""
     if len(sys.argv) < 2:
-        print("Usage: vtuber <command> [args]")
-        print("Commands: start, stop, status, chat, restart")
+        console.print(USAGE)
         sys.exit(1)
 
     command = sys.argv[1]
@@ -30,7 +45,8 @@ def main():
         stop_daemon()
         start_daemon_background()
     else:
-        print(f"Unknown command: {command}")
+        console.print(f"[red]未知命令：{command}[/red]")
+        console.print(USAGE)
         sys.exit(1)
 
 

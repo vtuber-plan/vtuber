@@ -3,6 +3,13 @@
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.rule import Rule
+
 from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import (
     AssistantMessage,
@@ -17,6 +24,10 @@ from claude_agent_sdk.types import (
 
 from vtuber.config import ensure_config_dir, get_persona_path, get_user_path
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
+
+console = Console()
+prompt_session = PromptSession()
+
 
 def _get_allowed_files() -> set[str]:
     """Compute allowed file paths at call time (not import time)."""
@@ -41,7 +52,6 @@ async def _onboarding_permission(
         if file_path not in allowed:
             return PermissionResultDeny(message="Onboarding 只允许读取 persona.md 和 user.md")
         return PermissionResultAllow()
-    # Default deny for any other tool
     return PermissionResultDeny(message=f"Onboarding 不允许使用 {tool_name} 工具")
 
 
@@ -114,12 +124,18 @@ async def _query_and_collect(
         text = _extract_stream_text(msg)
         if text:
             collected += text
-            if print_stream:
-                print(text, end="", flush=True)
         elif isinstance(msg, ResultMessage):
             break
-    if print_stream:
-        print()
+    if print_stream and collected.strip():
+        console.print()
+        console.print(
+            Panel(
+                Markdown(collected.strip()),
+                title="[bold cyan]AI[/bold cyan]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
     return collected
 
 
@@ -131,24 +147,28 @@ async def _run_phase(
     target_path: Path,
 ):
     """Run one onboarding phase: user input -> AI summarize -> confirm/revise loop -> write file."""
-    print(f"\n--- {phase_name} ---\n")
+    console.print()
+    console.print(Rule(f"[bold]{phase_name}[/bold]", style="blue"))
+    console.print()
+    console.print(f"[bold]{prompt_text}[/bold]")
 
-    # Get user input
-    user_input = input(prompt_text + "\n> ")
+    user_input = prompt_session.prompt(
+        HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
+    )
 
-    # Send to AI with instruction
     await _query_and_collect(agent, ai_instruction + user_input)
 
-    # Confirm/revise loop — exit when file is written or user quits
     while not target_path.exists():
         try:
-            user_reply = input("\n> ")
+            user_reply = prompt_session.prompt(
+                HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
+            )
         except (EOFError, KeyboardInterrupt):
-            print("\n跳过此阶段，使用默认配置。")
+            console.print("\n[yellow]跳过此阶段，使用默认配置。[/yellow]")
             return
         await _query_and_collect(agent, user_reply)
 
-    print(f"\n✓ {phase_name} 已保存到 {target_path}")
+    console.print(f"\n[green bold]✓[/green bold] {phase_name} 已保存到 [dim]{target_path}[/dim]")
 
 
 async def run_onboarding():
@@ -165,13 +185,18 @@ async def run_onboarding():
         default_persona=DEFAULT_PERSONA.strip(),
     )
 
-    print("\n" + "=" * 60)
-    print("  欢迎使用 VTuber 数字生命助手！")
-    print("  Welcome to VTuber Digital Life Assistant!")
-    print("=" * 60)
-    print("\n这是您第一次运行，让我们完成初始设置。\n")
+    console.print()
+    console.print(
+        Panel(
+            "[bold]欢迎使用 VTuber 数字生命助手！[/bold]\n"
+            "[dim]Welcome to VTuber Digital Life Assistant![/dim]\n\n"
+            "这是您第一次运行，让我们完成初始设置。",
+            title="[bold magenta]VTuber Setup[/bold magenta]",
+            border_style="magenta",
+            padding=(1, 2),
+        )
+    )
 
-    # Create onboarding agent with restricted permissions
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         tools=["Read", "Write", "Edit", "MultiEdit"],
@@ -181,7 +206,6 @@ async def run_onboarding():
     await agent.connect()
 
     try:
-        # Phase 1: User profile
         await _run_phase(
             agent=agent,
             phase_name="用户档案",
@@ -194,7 +218,6 @@ async def run_onboarding():
             target_path=get_user_path(),
         )
 
-        # Phase 2: AI persona
         await _run_phase(
             agent=agent,
             phase_name="AI 人格设定",
@@ -209,10 +232,17 @@ async def run_onboarding():
     finally:
         await agent.disconnect()
 
-    print("\n" + "=" * 60)
-    print("  设置完成！您的 VTuber 数字生命助手已准备就绪。")
-    print("=" * 60)
-    print("\n运行 'vtuber chat' 开始对话\n")
+    console.print()
+    console.print(
+        Panel(
+            "[bold green]设置完成！[/bold green] 您的 VTuber 数字生命助手已准备就绪。\n\n"
+            "运行 [bold]vtuber start[/bold] 启动 daemon\n"
+            "运行 [bold]vtuber chat[/bold] 开始对话",
+            title="[bold magenta]Setup Complete[/bold magenta]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
 
 
 async def check_and_run_onboarding():

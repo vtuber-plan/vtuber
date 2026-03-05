@@ -1,11 +1,23 @@
-"""CLI client for connecting to the VTuber daemon."""
+"""CLI client for connecting to the VTuber daemon with rich UI."""
 
 import asyncio
 import sys
 from pathlib import Path
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.live import Live
+from rich.text import Text
+
 from vtuber.daemon.protocol import encode_message, decode_message
-from vtuber.config import get_socket_path
+from vtuber.config import get_socket_path, ensure_config_dir
+
+console = Console()
 
 
 class CLIClient:
@@ -16,12 +28,25 @@ class CLIClient:
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.running = False
+        self._stream_buffer = ""
+        self._is_streaming = False
+        self._live: Live | None = None
+
+        # Setup prompt with history
+        history_path = ensure_config_dir() / "cli_history"
+        self.session = PromptSession(history=FileHistory(str(history_path)))
 
     async def connect(self):
         """Connect to the daemon server."""
         if not self.socket_path.exists():
-            print(f"Error: Daemon socket not found at {self.socket_path}")
-            print("Please start the daemon first with: vtuber start")
+            console.print(
+                Panel(
+                    "[red]Daemon 未运行[/red]\n\n"
+                    "请先启动 daemon：[bold]vtuber start[/bold]",
+                    title="连接失败",
+                    border_style="red",
+                )
+            )
             return False
 
         try:
@@ -29,11 +54,18 @@ class CLIClient:
                 str(self.socket_path)
             )
             self.running = True
-            print(f"Connected to daemon at {self.socket_path}")
-            print("Type your message and press Enter. Type /quit or /exit to quit.\n")
+            console.print(
+                Panel(
+                    "[green]已连接到 VTuber daemon[/green]\n"
+                    "输入消息并回车发送，输入 [bold]/quit[/bold] 或 [bold]/exit[/bold] 退出",
+                    title="VTuber Chat",
+                    border_style="green",
+                )
+            )
+            console.print()
             return True
         except Exception as e:
-            print(f"Error connecting to daemon: {e}")
+            console.print(f"[red]连接失败：{e}[/red]")
             return False
 
     async def disconnect(self):
@@ -45,7 +77,7 @@ class CLIClient:
                 await self.writer.wait_closed()
             except Exception:
                 pass
-        print("\nDisconnected from daemon")
+        console.print("\n[dim]已断开连接[/dim]")
 
     async def send_message(self, content: str):
         """Send a user message to the daemon."""
@@ -57,7 +89,7 @@ class CLIClient:
             self.writer.write(msg.encode("utf-8"))
             await self.writer.drain()
         except Exception as e:
-            print(f"Error sending message: {e}")
+            console.print(f"[red]发送失败：{e}[/red]")
 
     async def receive_messages(self):
         """Receive and display messages from the daemon."""
@@ -69,13 +101,12 @@ class CLIClient:
             while self.running:
                 data = await self.reader.read(4096)
                 if not data:
-                    print("\nDaemon connection closed")
+                    console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
                     self.running = False
                     break
 
                 buffer += data.decode("utf-8")
 
-                # Process complete messages
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     if line.strip():
@@ -84,7 +115,7 @@ class CLIClient:
             pass
         except Exception as e:
             if self.running:
-                print(f"\nError receiving messages: {e}")
+                console.print(f"\n[red]接收消息错误：{e}[/red]")
 
     async def _handle_message(self, line: str):
         """Handle a message from the daemon."""
@@ -92,79 +123,76 @@ class CLIClient:
             msg = decode_message(line)
             msg_type = msg.get("type")
 
-            if msg_type == "assistant_message":
-                # Stream assistant message
+            if msg_type in ("assistant_message", "task_message"):
                 content = msg.get("content", "")
                 is_final = msg.get("is_final", False)
 
-                # Print content without newline for streaming
                 if content:
-                    print(content, end="", flush=True)
-
-                # Add newline after final message
-                if is_final:
-                    print()  # Newline after complete message
-
-            elif msg_type == "task_message":
-                # Scheduled task result
-                content = msg.get("content", "")
-                is_final = msg.get("is_final", False)
-                task = msg.get("task", "")
-
-                if content:
-                    print(content, end="", flush=True)
+                    self._stream_buffer += content
+                    # Show streaming indicator
+                    if not self._is_streaming:
+                        self._is_streaming = True
 
                 if is_final:
-                    print()  # Newline after complete task message
+                    # Render complete response as markdown
+                    if self._stream_buffer.strip():
+                        label = "AI" if msg_type == "assistant_message" else "Task"
+                        console.print()
+                        console.print(
+                            Panel(
+                                Markdown(self._stream_buffer.strip()),
+                                title=f"[bold cyan]{label}[/bold cyan]",
+                                border_style="cyan",
+                                padding=(1, 2),
+                            )
+                        )
+                        console.print()
+                    self._stream_buffer = ""
+                    self._is_streaming = False
 
             elif msg_type == "error":
                 error = msg.get("content", "Unknown error")
-                print(f"\nError: {error}")
+                console.print(f"\n[red bold]错误：[/red bold] {error}")
 
             elif msg_type == "pong":
-                # Ignore pong responses
                 pass
 
-            else:
-                print(f"\nUnknown message type: {msg_type}")
-
         except Exception as e:
-            print(f"\nError handling message: {e}")
+            console.print(f"\n[red]处理消息错误：{e}[/red]")
 
     async def run(self):
         """Run the interactive CLI client."""
         if not await self.connect():
             return
 
-        # Start receive task
         receive_task = asyncio.create_task(self.receive_messages())
 
         try:
-            # Read user input
             while self.running:
                 try:
-                    # Read input in executor to avoid blocking
                     loop = asyncio.get_event_loop()
-                    user_input = await loop.run_in_executor(None, input, "> ")
+                    user_input = await loop.run_in_executor(
+                        None,
+                        lambda: self.session.prompt(
+                            HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
+                        ),
+                    )
 
-                    # Check for exit commands
                     if user_input.strip().lower() in ["/quit", "/exit"]:
                         break
 
-                    # Send message if not empty
                     if user_input.strip():
                         await self.send_message(user_input)
+                        # Show thinking spinner
+                        console.print("[dim]思考中...[/dim]", end="\r")
 
                 except EOFError:
-                    # Ctrl+D
                     break
                 except KeyboardInterrupt:
-                    # Ctrl+C
-                    print()
+                    console.print()
                     continue
 
         finally:
-            # Cancel receive task and disconnect
             receive_task.cancel()
             try:
                 await receive_task
@@ -179,10 +207,10 @@ def main():
         client = CLIClient()
         asyncio.run(client.run())
     except KeyboardInterrupt:
-        print("\n\nGoodbye!")
+        console.print("\n[dim]再见！[/dim]")
         sys.exit(0)
     except Exception as e:
-        print(f"Client error: {e}")
+        console.print(f"[red]客户端错误：{e}[/red]")
         sys.exit(1)
 
 
