@@ -19,8 +19,8 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from vtuber.config import ensure_config_dir, get_persona_path, get_user_path, get_heartbeat_path
-from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT
+from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path
+from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT, DEFAULT_CONFIG
 from vtuber.utils import extract_stream_text
 
 console = Console()
@@ -242,6 +242,7 @@ def create_default_configs():
     persona_path = get_persona_path()
     user_path = get_user_path()
     heartbeat_path = get_heartbeat_path()
+    config_path = get_config_path()
 
     if not persona_path.exists():
         persona_path.write_text(DEFAULT_PERSONA, encoding="utf-8")
@@ -251,3 +252,6 @@ def create_default_configs():
 
     if not heartbeat_path.exists():
         heartbeat_path.write_text(DEFAULT_HEARTBEAT, encoding="utf-8")
+
+    if not config_path.exists():
+        config_path.write_text(DEFAULT_CONFIG, encoding="utf-8")

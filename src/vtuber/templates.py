@@ -45,3 +45,23 @@ DEFAULT_HEARTBEAT = """# Heartbeat Task Checklist
 - Add custom periodic tasks here
 - The agent will review this list periodically
 """
+
+DEFAULT_CONFIG = """\
+# VTuber 配置文件
+# 修改后重启 daemon 生效: vtuber restart
+
+# Agent 工作目录
+workspace: ~/.vtuber/workspace
+
+# 心跳间隔（分钟）
+heartbeat_interval: 5
+
+# Claude CLI 路径
+cli_path: claude
+
+# 日志级别: DEBUG / INFO / WARNING / ERROR
+log_level: INFO
+
+# CLI 响应超时（秒）
+response_timeout: 300
+"""

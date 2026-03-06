@@ -26,6 +26,8 @@ from vtuber.daemon.scheduler import TaskScheduler
 from vtuber.persona import build_system_prompt
 from vtuber.config import (
     ensure_config_dir,
+    ensure_workspace_dir,
+    get_config,
     get_socket_path,
     get_pid_path,
     get_db_path,
@@ -39,8 +41,6 @@ from vtuber.tools.memory import log_message, create_session_id
 from vtuber.utils import extract_stream_text, extract_tool_use_start
 
 logger = logging.getLogger("vtuber.daemon")
-
-CLI_PATH = "claude"
 
 
 def setup_logging():
@@ -59,7 +59,7 @@ def setup_logging():
     )
 
     root = logging.getLogger("vtuber")
-    root.setLevel(logging.DEBUG)
+    root.setLevel(getattr(logging, get_config().log_level, logging.INFO))
     root.addHandler(handler)
 
     # Also log to stderr when running in foreground
@@ -138,7 +138,7 @@ class DaemonServer:
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._task_consumer: asyncio.Task | None = None
         self._agent_lock: asyncio.Lock = asyncio.Lock()
-        self.heartbeat_interval: int = 5  # Minutes between heartbeats
+        self.heartbeat_interval: int = get_config().heartbeat_interval
         self.session_id: str = create_session_id()
         # Track which provider_id initiated the current agent request
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
@@ -147,6 +147,10 @@ class DaemonServer:
         """Start the daemon server."""
         # Ensure config directory exists
         ensure_config_dir()
+
+        # Ensure workspace directory exists
+        workspace = ensure_workspace_dir()
+        logger.info("Workspace: %s", workspace)
 
         # Ensure config files exist (use defaults if onboarding wasn't run)
         from vtuber.onboarding import create_default_configs
@@ -228,7 +232,8 @@ class DaemonServer:
                 mcp_servers={"vtuber-tools": tools_server},
                 allowed_tools=allowed_tools,
                 permission_mode="bypassPermissions",
-                cli_path=CLI_PATH,
+                cli_path=get_config().cli_path,
+                cwd=str(ensure_workspace_dir()),
             )
             subagent = ClaudeSDKClient(options)
             await subagent.connect()
@@ -305,7 +310,8 @@ class DaemonServer:
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
-            cli_path=CLI_PATH,
+            cli_path=get_config().cli_path,
+            cwd=str(ensure_workspace_dir()),
         )
         self.agent = ClaudeSDKClient(options)
         await self.agent.connect()

@@ -1,5 +1,78 @@
-"""Configuration directory and file path utilities."""
+"""Configuration directory, file paths, and user settings."""
+
 from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+
+# ── User configuration model ────────────────────────────────────────
+
+
+class VTuberConfig(BaseModel):
+    """User-configurable settings loaded from ~/.vtuber/config.yaml."""
+
+    workspace: str = Field(
+        default="~/.vtuber/workspace",
+        description="Agent working directory",
+    )
+    heartbeat_interval: int = Field(
+        default=5,
+        ge=1,
+        description="Minutes between heartbeat checks",
+    )
+    cli_path: str = Field(
+        default="claude",
+        description="Path to Claude CLI binary",
+    )
+    log_level: str = Field(
+        default="INFO",
+        pattern="^(DEBUG|INFO|WARNING|ERROR)$",
+        description="Logging level",
+    )
+    response_timeout: int = Field(
+        default=300,
+        ge=10,
+        description="CLI response timeout in seconds",
+    )
+
+
+_config: VTuberConfig | None = None
+
+
+def get_config_path() -> Path:
+    """Get the config.yaml file path."""
+    return get_config_dir() / "config.yaml"
+
+
+def load_config() -> VTuberConfig:
+    """Load config from ~/.vtuber/config.yaml, falling back to defaults."""
+    config_path = get_config_path()
+    if config_path.exists():
+        try:
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return VTuberConfig(**raw)
+        except Exception:
+            pass
+    return VTuberConfig()
+
+
+def get_config() -> VTuberConfig:
+    """Get the singleton config instance (lazy-loaded)."""
+    global _config
+    if _config is None:
+        _config = load_config()
+    return _config
+
+
+def reset_config() -> None:
+    """Reset the cached config (forces reload on next get_config() call)."""
+    global _config
+    _config = None
+
+
+# ── Config directory and file paths ─────────────────────────────────
 
 
 def get_config_dir() -> Path:
@@ -12,6 +85,18 @@ def ensure_config_dir() -> Path:
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
+
+
+def get_workspace_dir() -> Path:
+    """Get the agent workspace directory path (resolved from config)."""
+    return Path(get_config().workspace).expanduser().resolve()
+
+
+def ensure_workspace_dir() -> Path:
+    """Ensure the workspace directory exists and return its path."""
+    workspace = get_workspace_dir()
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
 
 
 def get_persona_path() -> Path:

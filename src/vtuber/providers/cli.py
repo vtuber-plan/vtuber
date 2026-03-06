@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from vtuber.config import ensure_config_dir
+from vtuber.config import ensure_config_dir, get_config
 from vtuber.providers.base import Provider
 
 console = Console()
@@ -147,7 +147,9 @@ class CLIProvider(Provider):
         with Live(spinner, console=console, transient=True, refresh_per_second=12) as live:
             while True:
                 try:
-                    msg = await asyncio.wait_for(self._msg_queue.get(), timeout=300)
+                    msg = await asyncio.wait_for(
+                        self._msg_queue.get(), timeout=get_config().response_timeout
+                    )
                 except asyncio.TimeoutError:
                     console.print("[yellow]响应超时（5分钟无活动）[/yellow]")
                     return
