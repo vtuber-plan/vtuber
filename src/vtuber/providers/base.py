@@ -227,3 +227,46 @@ class Provider(ABC):
     async def run(self) -> None:
         """Main event loop for this provider."""
         ...
+
+
+class QueuedProvider(Provider):
+    """Provider that queues incoming daemon messages for the main loop.
+
+    Most terminal/chat providers share the same pattern: queue messages
+    from the daemon and consume them in the main loop. This base class
+    provides the common callback implementations.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._msg_queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_response(self, content: str, *, done: bool) -> None:
+        await self._msg_queue.put({
+            "type": "assistant_message",
+            "content": content,
+            "done": done,
+        })
+
+    async def on_progress(self, tool: str) -> None:
+        await self._msg_queue.put({"type": "progress", "tool": tool})
+
+    async def on_error(self, error: str) -> None:
+        await self._msg_queue.put({"type": "error", "content": error})
+
+    async def on_heartbeat(self, content: str) -> None:
+        await self._msg_queue.put({
+            "type": "heartbeat_message",
+            "content": content,
+        })
+
+    async def on_task(self, content: str, task: str, *, done: bool) -> None:
+        await self._msg_queue.put({
+            "type": "task_message",
+            "content": content,
+            "task": task,
+            "done": done,
+        })
+
+    async def on_disconnected(self) -> None:
+        pass

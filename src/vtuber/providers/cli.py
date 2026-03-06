@@ -14,56 +14,28 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from vtuber.config import ensure_config_dir, get_config
-from vtuber.providers.base import Provider
+from vtuber.providers.base import QueuedProvider
 
 console = Console()
 
 
-class CLIProvider(Provider):
+class CLIProvider(QueuedProvider):
     """Terminal-based provider using prompt_toolkit + rich.
 
-    Linear flow: input → spinner → response panel → next input.
+    Linear flow: input -> spinner -> response panel -> next input.
     """
 
     provider_type = "cli"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._msg_queue: asyncio.Queue = asyncio.Queue()
         self._pending_heartbeats: list[str] = []
 
         # Setup prompt with history
         history_path = ensure_config_dir() / "cli_history"
         self.session = PromptSession(history=FileHistory(str(history_path)))
 
-    # ── Provider callbacks ───────────────────────────────────────
-
-    async def on_response(self, content: str, *, done: bool) -> None:
-        await self._msg_queue.put({
-            "type": "assistant_message",
-            "content": content,
-            "done": done,
-        })
-
-    async def on_progress(self, tool: str) -> None:
-        await self._msg_queue.put({"type": "progress", "tool": tool})
-
-    async def on_error(self, error: str) -> None:
-        await self._msg_queue.put({"type": "error", "content": error})
-
-    async def on_heartbeat(self, content: str) -> None:
-        await self._msg_queue.put({
-            "type": "heartbeat_message",
-            "content": content,
-        })
-
-    async def on_task(self, content: str, task: str, *, done: bool) -> None:
-        await self._msg_queue.put({
-            "type": "task_message",
-            "content": content,
-            "task": task,
-            "done": done,
-        })
+    # ── Provider callback overrides ───────────────────────────────
 
     async def on_disconnected(self) -> None:
         console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
@@ -178,10 +150,7 @@ class CLIProvider(Provider):
     # ── Main loop ────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Run the interactive CLI provider.
-
-        Linear flow: prompt → send → spinner → response → prompt.
-        """
+        """Run the interactive CLI provider."""
         if not await self.connect():
             console.print(
                 Panel(

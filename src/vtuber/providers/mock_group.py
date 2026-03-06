@@ -15,7 +15,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from vtuber.config import get_config
-from vtuber.providers.base import ChatMessage, Provider
+from vtuber.providers.base import ChatMessage, QueuedProvider
 
 console = Console()
 
@@ -55,7 +55,7 @@ SENDER_COLORS = {
 BATCH_SIZE = 5
 
 
-class MockGroupProvider(Provider):
+class MockGroupProvider(QueuedProvider):
     """Mock group chat provider for testing.
 
     Simulates a group chat with pre-seeded fake messages.
@@ -67,24 +67,10 @@ class MockGroupProvider(Provider):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._msg_queue: asyncio.Queue = asyncio.Queue()
         self._round = 0
         self.session = PromptSession()
 
-    # ── Provider callbacks ───────────────────────────────────────
-
-    async def on_response(self, content: str, *, done: bool) -> None:
-        await self._msg_queue.put({
-            "type": "assistant_message",
-            "content": content,
-            "done": done,
-        })
-
-    async def on_progress(self, tool: str) -> None:
-        await self._msg_queue.put({"type": "progress", "tool": tool})
-
-    async def on_error(self, error: str) -> None:
-        await self._msg_queue.put({"type": "error", "content": error})
+    # ── Provider callback overrides ───────────────────────────────
 
     async def on_heartbeat(self, content: str) -> None:
         pass  # ignore heartbeats in mock
@@ -217,7 +203,6 @@ class MockGroupProvider(Provider):
                         return
 
                     if not user_input.strip():
-                        # Use a random filler message
                         user_input = random.choice(["嗯嗯", "哈哈", "有道理", "确实"])
 
                     user_msg = ChatMessage(sender="You", content=user_input.strip())
@@ -228,7 +213,6 @@ class MockGroupProvider(Provider):
                 console.print()
                 console.print("[dim]>>> 发送 {0} 条消息给 Agent...[/dim]".format(len(buffer)))
 
-                # Last message is the trigger, rest is context
                 trigger = buffer[-1]
                 context = buffer[:-1]
 
@@ -241,7 +225,6 @@ class MockGroupProvider(Provider):
                     context=context,
                 )
 
-                # Wait for response
                 response = await self._wait_for_response()
 
                 if response:

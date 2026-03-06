@@ -8,41 +8,27 @@ import signal
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
 
-from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
-from claude_agent_sdk.types import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    StreamEvent,
-    TextBlock,
-    ToolUseBlock,
-)
+from claude_agent_sdk import ClaudeSDKClient
 
-from vtuber.daemon.gateway import Gateway, ProviderConnection
-from vtuber.daemon.protocol import decode_message, encode_message, MessageType
-from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.persona import build_system_prompt
 from vtuber.config import (
     ensure_config_dir,
     ensure_workspace_dir,
     get_config,
-    get_socket_path,
-    get_pid_path,
     get_db_path,
-    get_persona_path,
-    get_user_path,
-    get_heartbeat_path,
-    get_history_path,
-    get_consolidation_state_path,
     get_log_path,
-    get_sessions_dir,
+    get_pid_path,
+    get_socket_path,
 )
+from vtuber.daemon.agents import GroupAgentManager, create_agent
+from vtuber.daemon.gateway import Gateway, ProviderConnection
+from vtuber.daemon.heartbeat import HeartbeatManager
+from vtuber.daemon.protocol import MessageType, decode_message, encode_message
+from vtuber.daemon.scheduler import TaskScheduler
+from vtuber.daemon.streaming import iter_response, truncate
+from vtuber.daemon.tasks import ScheduledTaskRunner
+from vtuber.tools.memory import create_session_id, log_message
 from vtuber.tools.schedule import set_scheduler, set_task_queue
-from vtuber.tools.memory import log_message, create_session_id, append_history
-from vtuber.templates import DEFAULT_HEARTBEAT
-from vtuber.utils import extract_stream_text, extract_tool_use_start
 
 logger = logging.getLogger("vtuber.daemon")
 
@@ -77,174 +63,56 @@ def setup_logging():
         root.addHandler(console_handler)
 
 
-def _truncate(s: str, max_len: int = 200) -> str:
-    """Truncate a string for log display."""
-    s = s.replace("\n", " ").strip()
-    return s[:max_len] + "..." if len(s) > max_len else s
-
-
-def _log_stream_event(msg, source: str = "agent"):
-    """Log interesting stream events (tool calls, results, errors)."""
-    if isinstance(msg, StreamEvent):
-        event = msg.event
-        etype = event.get("type")
-
-        if etype == "content_block_start":
-            block = event.get("content_block", {})
-            if block.get("type") == "tool_use":
-                tool_name = block.get("name", "?")
-                logger.debug("[%s] tool_call: %s", source, tool_name)
-
-    elif isinstance(msg, AssistantMessage):
-        for block in msg.content:
-            if isinstance(block, ToolUseBlock):
-                input_preview = _truncate(json.dumps(block.input, ensure_ascii=False))
-                logger.debug("[%s] tool_call: %s(%s)", source, block.name, input_preview)
-            elif isinstance(block, TextBlock) and block.text:
-                logger.debug("[%s] text: %s", source, _truncate(block.text))
-
-    elif isinstance(msg, ResultMessage):
-        cost = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"
-        logger.info(
-            "[%s] result: turns=%d, cost=%s, duration=%dms",
-            source, msg.num_turns, cost, msg.duration_ms,
-        )
-
-
-def _create_tools_server(include_schedule: bool = True):
-    """Create an SDK MCP server with vtuber tools."""
-    from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
-
-    tools = [search_sessions, list_sessions, read_session, search_history]
-    allowed = ["search_sessions", "list_sessions", "read_session", "search_history"]
-
-    if include_schedule:
-        from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
-
-        tools.extend([schedule_create, schedule_list, schedule_cancel])
-        allowed.extend(["schedule_create", "schedule_list", "schedule_cancel"])
-
-    server = create_sdk_mcp_server("vtuber-tools", tools=tools)
-    return server, allowed
-
-
-class GroupAgentManager:
-    """Manages per-channel persistent agents for group chats."""
-
-    def __init__(self):
-        self._agents: dict[str, ClaudeSDKClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-
-    async def get_or_create(self, channel_id: str) -> ClaudeSDKClient:
-        """Get an existing agent for a channel, or create a new one."""
-        if channel_id not in self._agents:
-            agent = await self._create_agent(channel_id)
-            self._agents[channel_id] = agent
-            self._locks[channel_id] = asyncio.Lock()
-            logger.info("[group/%s] created persistent agent", channel_id)
-        return self._agents[channel_id]
-
-    def get_lock(self, channel_id: str) -> asyncio.Lock:
-        """Get the concurrency lock for a channel's agent."""
-        if channel_id not in self._locks:
-            self._locks[channel_id] = asyncio.Lock()
-        return self._locks[channel_id]
-
-    async def _create_agent(self, channel_id: str) -> ClaudeSDKClient:
-        """Create a new persistent agent for a group channel."""
-        persona_path = get_persona_path()
-        user_path = get_user_path()
-        system_prompt = build_system_prompt(persona_path, user_path)
-
-        tools_server, allowed_tools = _create_tools_server(include_schedule=False)
-        options = ClaudeAgentOptions(
-            system_prompt=(
-                f"{system_prompt}\n\n"
-                f"你正在参与一个群聊（频道: {channel_id}）。\n"
-                "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
-                "如果对话不需要你参与，请只回复: NO_RESPONSE\n"
-                "如果需要回复，直接回复内容即可，不要加任何前缀。"
-            ),
-            mcp_servers={"vtuber-tools": tools_server},
-            allowed_tools=allowed_tools,
-            permission_mode="bypassPermissions",
-            cli_path=get_config().cli_path,
-            cwd=str(ensure_workspace_dir()),
-            extra_args={"no-session-persistence": None},
-        )
-        agent = ClaudeSDKClient(options)
-        await agent.connect()
-        return agent
-
-    async def close_all(self):
-        """Disconnect all group agents."""
-        for channel_id, agent in self._agents.items():
-            try:
-                await agent.disconnect()
-                logger.info("[group/%s] agent disconnected", channel_id)
-            except Exception:
-                pass
-        self._agents.clear()
-        self._locks.clear()
-
-
 class DaemonServer:
     """Unix Domain Socket server that manages provider connections and agent sessions."""
 
     def __init__(self, socket_path: Path | None = None):
         self.socket_path = socket_path or get_socket_path()
         self.is_running = False
-        self.gateway: Gateway = Gateway()
+        self.gateway = Gateway()
         self.agent: ClaudeSDKClient | None = None
         self.scheduler: TaskScheduler | None = None
-        self.conversation_history: list[dict[str, Any]] = []
         self._server: asyncio.Server | None = None
-        self._heartbeat_task: asyncio.Task | None = None
         self._task_queue: asyncio.Queue = asyncio.Queue()
-        self._task_consumer: asyncio.Task | None = None
-        self._agent_lock: asyncio.Lock = asyncio.Lock()
-        self.group_agents: GroupAgentManager = GroupAgentManager()
-        self.heartbeat_interval: int = get_config().heartbeat_interval
-        self.session_id: str = create_session_id()
-        self._message_count: int = 0
-        self._consolidation_running: bool = False
-        self._consolidation_task: asyncio.Task | None = None
-        # Track which provider_id initiated the current agent request
+        self._agent_lock = asyncio.Lock()
+        self.group_agents = GroupAgentManager()
+        self.session_id = create_session_id()
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
+
+        # Subsystems (initialized in start())
+        self._heartbeat: HeartbeatManager | None = None
+        self._task_runner: ScheduledTaskRunner | None = None
 
     async def start(self):
         """Start the daemon server."""
-        # Ensure config directory exists
         ensure_config_dir()
-
-        # Ensure workspace directory exists
         workspace = ensure_workspace_dir()
         logger.info("Workspace: %s", workspace)
 
-        # Ensure config files exist (use defaults if onboarding wasn't run)
         from vtuber.onboarding import create_default_configs
-
         create_default_configs()
 
-        # Remove old socket if exists
+        # Remove old socket
         if self.socket_path.exists():
             self.socket_path.unlink()
 
         # Initialize scheduler
         db_path = get_db_path()
         self.scheduler = TaskScheduler(db_path)
-
-        # Wire up task queue before starting scheduler
         set_task_queue(self._task_queue)
         set_scheduler(self.scheduler)
         self.scheduler.start()
 
-        # Start queue consumer for scheduled tasks
-        self._task_consumer = asyncio.create_task(self._process_scheduled_tasks())
+        # Start scheduled task runner
+        self._task_runner = ScheduledTaskRunner(self.gateway, self._task_queue)
+        self._task_runner.start()
         logger.info("Scheduler started (db=%s)", db_path)
 
-        # Initialize agent
-        await self._initialize_agent()
+        # Initialize main agent
+        self.agent = await create_agent(
+            include_schedule=True,
+            include_preset_tools=True,
+        )
         logger.info("Agent initialized")
 
         # Start Unix socket server
@@ -254,154 +122,35 @@ class DaemonServer:
         )
         self.is_running = True
 
-        # Start heartbeat timer after is_running is set so the loop condition works
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info("Heartbeat started (every %d min)", self.heartbeat_interval)
+        # Start heartbeat
+        config = get_config()
+        self._heartbeat = HeartbeatManager(
+            self.gateway, self.session_id, config.heartbeat_interval,
+        )
+        self._heartbeat.start()
 
         # Write PID file
         pid_path = get_pid_path()
         pid_path.write_text(str(os.getpid()))
 
-        logger.info("Daemon started on %s (pid=%d, session=%s)",
-                     self.socket_path, os.getpid(), self.session_id)
+        logger.info(
+            "Daemon started on %s (pid=%d, session=%s)",
+            self.socket_path, os.getpid(), self.session_id,
+        )
 
         # Setup signal handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-    async def _process_scheduled_tasks(self):
-        """Consume scheduled tasks from the queue and execute them."""
-        try:
-            while True:
-                task_prompt = await self._task_queue.get()
-                try:
-                    await self._execute_scheduled_task(task_prompt)
-                except Exception as e:
-                    logger.error("Scheduled task error: %s", e, exc_info=True)
-                finally:
-                    self._task_queue.task_done()
-        except asyncio.CancelledError:
-            pass
-
-    async def _execute_scheduled_task(self, task_prompt: str):
-        """Execute a scheduled task using a temporary subagent."""
-        logger.info("[schedule] executing: %s", _truncate(task_prompt))
-
-        # Create a temporary subagent with independent context
-        try:
-            persona_path = get_persona_path()
-            user_path = get_user_path()
-            system_prompt = build_system_prompt(persona_path, user_path)
-
-            # Create subagent with memory tools only
-            tools_server, allowed_tools = _create_tools_server(include_schedule=False)
-            options = ClaudeAgentOptions(
-                system_prompt=f"{system_prompt}\n\nYou are executing a scheduled task. Respond concisely.",
-                mcp_servers={"vtuber-tools": tools_server},
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",
-                cli_path=get_config().cli_path,
-                cwd=str(ensure_workspace_dir()),
-            )
-            subagent = ClaudeSDKClient(options)
-            await subagent.connect()
-
-            # Execute task
-            stream_id = f"task_{id(subagent)}"
-            index = 0
-
-            await subagent.query(f"[Scheduled Task] {task_prompt}")
-            async for msg in subagent.receive_response():
-                _log_stream_event(msg, "schedule")
-
-                tool_name = extract_tool_use_start(msg)
-                if tool_name:
-                    await self.gateway.broadcast({
-                        "type": MessageType.PROGRESS,
-                        "tool": tool_name,
-                    })
-                    continue
-
-                text = extract_stream_text(msg)
-                if text:
-                    # Stream result to all providers
-                    await self.gateway.broadcast(
-                        {
-                            "type": MessageType.TASK_MESSAGE,
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": text,
-                            "task": task_prompt,
-                            "done": False,
-                        }
-                    )
-                    index += 1
-
-                elif isinstance(msg, ResultMessage):
-                    # Send final message
-                    await self.gateway.broadcast(
-                        {
-                            "type": MessageType.TASK_MESSAGE,
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": "",
-                            "task": task_prompt,
-                            "done": True,
-                        }
-                    )
-
-            await subagent.disconnect()
-            logger.info("[schedule] completed: %s", _truncate(task_prompt))
-
-        except Exception as e:
-            logger.error("[schedule] failed: %s — %s", _truncate(task_prompt), e, exc_info=True)
-            # Notify providers of error
-            await self.gateway.broadcast(
-                {
-                    "type": MessageType.ERROR,
-                    "content": f"Error executing task '{task_prompt}': {str(e)}",
-                }
-            )
-
-    async def _initialize_agent(self):
-        """Initialize the main Claude SDK client with persona and user profile."""
-        system_prompt = build_system_prompt(get_persona_path(), get_user_path())
-
-        # Create SDK MCP server with all tools
-        tools_server, allowed_tools = _create_tools_server(include_schedule=True)
-
-        # Create agent with all Claude Code tools + custom vtuber tools
-        options = ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            # system_prompt={
-            #     "type": "preset",
-            #     "preset": "claude_code",  # Use Claude Code's system prompt
-            #     "append": system_prompt,
-            # },
-            tools={"type": "preset", "preset": "claude_code"},
-            mcp_servers={"vtuber-tools": tools_server},
-            allowed_tools=allowed_tools,
-            permission_mode="bypassPermissions",
-            cli_path=get_config().cli_path,
-            cwd=str(ensure_workspace_dir()),
-            extra_args={"no-session-persistence": None},
-        )
-        self.agent = ClaudeSDKClient(options)
-        await self.agent.connect()
+    # ── Client handling ───────────────────────────────────────────
 
     async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ):
-        """Handle a new client connection.
-
-        The client must send a 'register' message first to identify itself.
-        Unregistered connections can still send ping/pong but not user messages.
-        """
+        """Handle a new client connection."""
         addr = writer.get_extra_info("peername") or "client"
         provider_id: str | None = None
-
-        # Keep writer reference so we can respond before registration
         self._pending_writers[id(writer)] = writer
 
         try:
@@ -413,21 +162,17 @@ class DaemonServer:
                         break
 
                     buffer += data
-
                     while b"\n" in buffer:
                         raw_line, buffer = buffer.split(b"\n", 1)
                         line = raw_line.decode("utf-8", errors="replace")
                         if line.strip():
-                            await self._process_message(
-                                line, writer, provider_id
-                            )
+                            await self._process_message(line, writer, provider_id)
                             # Check if registration happened
                             if provider_id is None:
                                 for pid, conn in self.gateway.connections.items():
                                     if conn.writer is writer:
                                         provider_id = pid
                                         break
-
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -446,15 +191,14 @@ class DaemonServer:
                 logger.info("Unregistered client disconnected: %s", addr)
 
     async def _process_message(
-        self, line: str, writer: asyncio.StreamWriter, provider_id: str | None
+        self, line: str, writer: asyncio.StreamWriter, provider_id: str | None,
     ):
-        """Process a message from a provider."""
+        """Route an incoming message to the appropriate handler."""
         try:
             msg = decode_message(line)
             msg_type = msg.get("type")
 
             if msg_type == MessageType.REGISTER:
-                # Provider registration
                 conn = ProviderConnection(
                     provider_type=msg.get("provider", "unknown"),
                     provider_id=msg.get("provider_id", f"anon-{id(writer)}"),
@@ -468,14 +212,13 @@ class DaemonServer:
                 is_owner = msg.get("is_owner", True)
                 is_private = msg.get("is_private", True)
                 channel_id = msg.get("channel_id")
-                context = msg.get("context")  # list[{sender, content}] or None
+                context = msg.get("context")
                 pid = provider_id or msg.get("provider_id")
+
                 if not pid:
                     logger.warning("User message from unregistered provider, ignoring")
                 elif is_private:
-                    await self._handle_private_message(
-                        content, pid, sender, is_owner,
-                    )
+                    await self._handle_private_message(content, pid, sender, is_owner)
                 else:
                     await self._handle_group_message(
                         content, pid, sender, is_owner,
@@ -495,6 +238,8 @@ class DaemonServer:
         except Exception as e:
             logger.error("Error processing message: %s", e, exc_info=True)
 
+    # ── Message handlers ──────────────────────────────────────────
+
     async def _handle_private_message(
         self, content: str, provider_id: str, sender: str, is_owner: bool,
     ):
@@ -507,9 +252,8 @@ class DaemonServer:
             return
 
         log_message(self.session_id, "user", content, sender=sender)
-        logger.debug("[%s] %s", sender, _truncate(content))
+        logger.debug("[%s] %s", sender, truncate(content))
 
-        # Owner messages go directly; non-owner DMs get a sender prefix
         query_content = content if is_owner else f"[{sender}]: {content}"
 
         try:
@@ -517,12 +261,8 @@ class DaemonServer:
                 await self._stream_agent_response(
                     self.agent, query_content, provider_id, "agent",
                 )
-            # Track message count for auto-consolidation
-            self._message_count += 1
-            if self._message_count >= 50 and not self._consolidation_running:
-                self._consolidation_task = asyncio.create_task(
-                    self._trigger_consolidation()
-                )
+            if self._heartbeat:
+                self._heartbeat.on_message()
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -542,16 +282,14 @@ class DaemonServer:
     ):
         """Handle a group chat message — routes to a per-channel persistent agent."""
         channel_label = channel_id or "unknown"
-        logger.debug("[group/%s] %s: %s", channel_label, sender, _truncate(content))
+        logger.debug("[group/%s] %s: %s", channel_label, sender, truncate(content))
 
-        # Build the query with conversation context
         query_parts = []
         if context:
             query_parts.append("[群聊上下文]")
             for msg in context:
                 query_parts.append(f"{msg.get('sender', '?')}: {msg.get('content', '')}")
-            query_parts.append("")  # blank line separator
-
+            query_parts.append("")
         query_parts.append(f"[{sender}]: {content}")
         query_text = "\n".join(query_parts)
 
@@ -580,311 +318,76 @@ class DaemonServer:
         *,
         no_response_token: str | None = None,
     ):
-        """Send a query to an agent and stream the response to a provider.
-
-        Args:
-            agent: The SDK client to query.
-            query: The query string.
-            provider_id: Where to send the streamed response.
-            log_source: Label for log messages.
-            no_response_token: If set and the full response matches this token,
-                               send an empty final message instead (agent chose not to respond).
-        """
+        """Send a query to an agent and stream the response to a provider."""
         stream_id = f"stream_{provider_id}"
         index = 0
         assistant_text = ""
 
-        await agent.query(query)
-        async for msg in agent.receive_response():
-            _log_stream_event(msg, log_source)
-
-            tool_name = extract_tool_use_start(msg)
-            if tool_name:
+        async for event in iter_response(agent, query, log_source=log_source):
+            if event.type == "tool":
                 await self.gateway.send_to(provider_id, {
                     "type": MessageType.PROGRESS,
-                    "tool": tool_name,
+                    "tool": event.tool,
                 })
-                continue
-
-            text = extract_stream_text(msg)
-            if text:
-                logger.debug("[%s] → sending text chunk: %s", log_source, _truncate(text))
-                assistant_text += text
+            elif event.type == "text":
+                assistant_text += event.text
                 await self.gateway.send_to(provider_id, {
                     "type": MessageType.ASSISTANT_MESSAGE,
                     "stream_id": stream_id,
                     "index": index,
-                    "content": text,
+                    "content": event.text,
                     "done": False,
                 })
                 index += 1
-
-            elif isinstance(msg, ResultMessage):
-                # Check for no-response token
-                if no_response_token and no_response_token in assistant_text.strip().upper():
+            elif event.type == "result":
+                is_no_response = (
+                    no_response_token
+                    and no_response_token in assistant_text.strip().upper()
+                )
+                final_msg = {
+                    "type": MessageType.ASSISTANT_MESSAGE,
+                    "stream_id": stream_id,
+                    "index": index,
+                    "content": "",
+                    "done": True,
+                }
+                if is_no_response:
                     logger.debug("[%s] agent chose not to respond", log_source)
-                    # Send empty final so provider knows the interaction is done
-                    await self.gateway.send_to(provider_id, {
-                        "type": MessageType.ASSISTANT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
-                        "content": "",
-                        "done": True,
-                        "no_response": True,
-                    })
-                else:
-                    await self.gateway.send_to(provider_id, {
-                        "type": MessageType.ASSISTANT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
-                        "content": "",
-                        "done": True,
-                    })
+                    final_msg["no_response"] = True
+                await self.gateway.send_to(provider_id, final_msg)
 
         if assistant_text.strip():
-            if not (no_response_token and no_response_token in assistant_text.strip().upper()):
+            is_no_response = (
+                no_response_token
+                and no_response_token in assistant_text.strip().upper()
+            )
+            if not is_no_response:
                 log_message(self.session_id, "assistant", assistant_text.strip())
 
-    async def _heartbeat_loop(self):
-        """Periodic heartbeat loop."""
-        while self.is_running:
-            try:
-                # Wait for interval
-                await asyncio.sleep(self.heartbeat_interval * 60)
-
-                if not self.is_running:
-                    break
-
-                # Send heartbeat to agent
-                await self._send_heartbeat()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Heartbeat error: %s", e, exc_info=True)
-
-    async def _send_heartbeat(self):
-        """Two-phase heartbeat: pre-check file content, then optionally call sub-agent."""
-        # Phase 1: Pre-check — skip LLM if HEARTBEAT.md is default/empty
-        heartbeat_path = get_heartbeat_path()
-        heartbeat_content = ""
-
-        if heartbeat_path.exists():
-            heartbeat_content = heartbeat_path.read_text(encoding="utf-8").strip()
-
-        if not heartbeat_content or heartbeat_content == DEFAULT_HEARTBEAT.strip():
-            logger.info("[heartbeat] skipped (default/empty HEARTBEAT.md)")
-            return
-
-        # Phase 2: Execute — use a temp sub-agent (lighter than main agent)
-        logger.info("[heartbeat] tasks found, executing with sub-agent")
-        try:
-            persona_path = get_persona_path()
-            user_path = get_user_path()
-            system_prompt = build_system_prompt(persona_path, user_path)
-
-            tools_server, allowed_tools = _create_tools_server(include_schedule=True)
-            options = ClaudeAgentOptions(
-                system_prompt=(
-                    f"{system_prompt}\n\n"
-                    "[HEARTBEAT] 请审查以下任务清单，决定是否有需要执行的任务。\n"
-                    "如果有任务需要执行，请执行它们并报告结果。\n"
-                    "如果没有需要执行的任务，请只回复空内容。"
-                ),
-                mcp_servers={"vtuber-tools": tools_server},
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",
-                cli_path=get_config().cli_path,
-                cwd=str(ensure_workspace_dir()),
-            )
-            subagent = ClaudeSDKClient(options)
-            await subagent.connect()
-
-            collected_text = ""
-
-            try:
-                await subagent.query(f"[Heartbeat Task Checklist]\n\n{heartbeat_content}")
-                async for msg in subagent.receive_response():
-                    _log_stream_event(msg, "heartbeat")
-
-                    tool_name = extract_tool_use_start(msg)
-                    if tool_name:
-                        logger.debug("[heartbeat] using tool: %s", tool_name)
-
-                    text = extract_stream_text(msg)
-                    if text:
-                        collected_text += text
-
-                    elif isinstance(msg, ResultMessage):
-                        pass
-            finally:
-                await subagent.disconnect()
-
-            # Broadcast if there's actionable output
-            if collected_text.strip():
-                logger.info("[heartbeat] agent responded: %s", _truncate(collected_text))
-                await self.gateway.broadcast({
-                    "type": MessageType.HEARTBEAT_MESSAGE,
-                    "content": collected_text,
-                })
-            else:
-                logger.info("[heartbeat] agent found nothing to do")
-
-            logger.info("[heartbeat] completed")
-
-        except Exception as e:
-            logger.error("[heartbeat] error: %s", e, exc_info=True)
-
-    async def _trigger_consolidation(self):
-        """Auto-consolidate session messages into long-term memory + history log.
-
-        Runs a temp sub-agent that reads the session log, updates
-        long_term_memory.md with new facts, and appends a summary to history.md.
-        """
-        self._consolidation_running = True
-        try:
-            session_path = get_sessions_dir() / f"{self.session_id}.jsonl"
-            if not session_path.exists():
-                return
-
-            # Read consolidation state (how many messages already consolidated)
-            state_path = get_consolidation_state_path()
-            last_consolidated = 0
-            if state_path.exists():
-                try:
-                    state = json.loads(state_path.read_text(encoding="utf-8"))
-                    if state.get("session_id") == self.session_id:
-                        last_consolidated = state.get("last_consolidated", 0)
-                except Exception:
-                    pass
-
-            # Read unconsolidated messages from session
-            lines = session_path.read_text(encoding="utf-8").strip().split("\n")
-            new_lines = lines[last_consolidated:]
-            if len(new_lines) < 20:
-                return  # Not enough new messages to justify consolidation
-
-            # Build a readable transcript of new messages
-            transcript_parts = []
-            for raw_line in new_lines:
-                try:
-                    entry = json.loads(raw_line)
-                    ts = entry.get("timestamp", "?")[:16]
-                    role = entry.get("role", "?")
-                    content = entry.get("content", "")[:500]
-                    transcript_parts.append(f"[{ts}] {role}: {content}")
-                except json.JSONDecodeError:
-                    continue
-
-            if not transcript_parts:
-                return
-
-            transcript = "\n".join(transcript_parts)
-
-            from vtuber.config import get_long_term_memory_path, get_history_path
-
-            memory_path = get_long_term_memory_path()
-            history_path = get_history_path()
-            current_memory = ""
-            if memory_path.exists():
-                current_memory = memory_path.read_text(encoding="utf-8").strip()
-
-            logger.info(
-                "[consolidation] starting: %d new messages (from %d)",
-                len(new_lines), last_consolidated,
-            )
-
-            # Create temp sub-agent for consolidation
-            options = ClaudeAgentOptions(
-                system_prompt=(
-                    "你是一个记忆整理助手。你的任务是：\n"
-                    f"1. 阅读下面的对话记录\n"
-                    f"2. 将有价值的长期事实更新到 {memory_path}\n"
-                    f"3. 在 {history_path} 末尾追加一段摘要（以 [YYYY-MM-DD HH:MM] 开头）\n\n"
-                    "长期记忆应该按主题组织，保持简洁（不超过200行）。\n"
-                    "历史摘要应该是2-5句话，概括对话中的关键事件和决策。\n"
-                    "不要删除长期记忆中已有的仍然有效的内容。"
-                ),
-                tools={"type": "preset", "preset": "claude_code"},
-                permission_mode="bypassPermissions",
-                cli_path=get_config().cli_path,
-                cwd=str(ensure_workspace_dir()),
-            )
-            subagent = ClaudeSDKClient(options)
-            await subagent.connect()
-
-            try:
-                query = (
-                    f"## 当前长期记忆\n\n{current_memory or '(空)'}\n\n"
-                    f"## 需要整理的对话记录\n\n{transcript}"
-                )
-                await subagent.query(query)
-                async for msg in subagent.receive_response():
-                    _log_stream_event(msg, "consolidation")
-                    if isinstance(msg, ResultMessage):
-                        break
-            finally:
-                await subagent.disconnect()
-
-            # Update consolidation state
-            total_consolidated = last_consolidated + len(new_lines)
-            state_path.write_text(
-                json.dumps({
-                    "session_id": self.session_id,
-                    "last_consolidated": total_consolidated,
-                }),
-                encoding="utf-8",
-            )
-            self._message_count = 0
-            logger.info("[consolidation] completed: consolidated up to message %d", total_consolidated)
-
-        except Exception as e:
-            logger.error("[consolidation] error: %s", e, exc_info=True)
-        finally:
-            self._consolidation_running = False
+    # ── Lifecycle ─────────────────────────────────────────────────
 
     async def shutdown(self):
         """Shutdown the daemon server gracefully."""
         if not self.is_running:
-            return  # Already shutting down
+            return
         logger.info("Shutting down daemon...")
         self.is_running = False
 
-        # Stop heartbeat task
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
+        # Stop subsystems
+        if self._heartbeat:
+            await self._heartbeat.stop()
+        if self._task_runner:
+            await self._task_runner.stop()
 
-        # Stop consolidation task
-        if self._consolidation_task and not self._consolidation_task.done():
-            self._consolidation_task.cancel()
-            try:
-                await self._consolidation_task
-            except asyncio.CancelledError:
-                pass
-
-        # Stop task queue consumer
-        if self._task_consumer:
-            self._task_consumer.cancel()
-            try:
-                await self._task_consumer
-            except asyncio.CancelledError:
-                pass
-
-        # Disconnect agent
+        # Disconnect agents
         if self.agent:
             try:
                 await self.agent.disconnect()
             except Exception:
                 pass
-
-        # Disconnect group agents
         await self.group_agents.close_all()
 
-        # Close all provider connections
+        # Close provider connections
         await self.gateway.close_all()
 
         # Shutdown scheduler
@@ -894,7 +397,7 @@ class DaemonServer:
             except Exception:
                 pass
 
-        # Close server
+        # Close socket server
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -902,7 +405,6 @@ class DaemonServer:
         # Remove socket and PID files
         if self.socket_path.exists():
             self.socket_path.unlink()
-
         pid_path = get_pid_path()
         if pid_path.exists():
             pid_path.unlink()
@@ -913,13 +415,15 @@ class DaemonServer:
         """Run the server until shutdown."""
         await self.start()
         try:
-            # Keep running until shutdown
             while self.is_running:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
         finally:
             await self.shutdown()
+
+
+# ── Daemon CLI helpers ────────────────────────────────────────────
 
 
 def start_daemon_background():
@@ -933,12 +437,10 @@ def start_daemon_background():
     if pid_path.exists():
         try:
             pid = int(pid_path.read_text().strip())
-            # Check if process is running
             os.kill(pid, 0)
             print(f"Daemon is already running (PID: {pid})")
             return
         except (OSError, ProcessLookupError):
-            # PID file exists but process not running, clean up
             pid_path.unlink()
             if socket_path.exists():
                 socket_path.unlink()
@@ -956,7 +458,7 @@ def start_daemon_background():
         from vtuber.onboarding import create_default_configs
         create_default_configs()
 
-    # Start daemon in background using subprocess
+    # Start daemon in background
     try:
         ensure_config_dir()
         log_path = get_log_path()
@@ -967,15 +469,13 @@ def start_daemon_background():
             stdout=log_file,
             stderr=log_file,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # Detach from terminal
+            start_new_session=True,
         )
-        log_file.close()  # Child inherits the fd; parent must close its copy
+        log_file.close()
         print("Daemon started in background")
         print(f"Log: {log_path}")
 
-        # Wait a moment and verify it started
         import time
-
         time.sleep(1)
 
         if pid_path.exists():
@@ -999,30 +499,23 @@ def stop_daemon():
 
     try:
         pid = int(pid_path.read_text().strip())
-
-        # Send SIGTERM to daemon
         os.kill(pid, signal.SIGTERM)
 
-        # Wait for process to terminate
         import time
-
-        for _ in range(10):  # Wait up to 10 seconds
+        for _ in range(10):
             try:
-                os.kill(pid, 0)  # Check if process is still running
+                os.kill(pid, 0)
                 time.sleep(1)
             except ProcessLookupError:
-                # Process has terminated
                 print(f"Daemon stopped (PID: {pid})")
                 return
 
-        # If still running, force kill
         print("Daemon did not stop gracefully, forcing...")
         os.kill(pid, signal.SIGKILL)
         print(f"Daemon killed (PID: {pid})")
 
     except ProcessLookupError:
         print("Daemon is not running (process not found)")
-        # Clean up stale PID file
         pid_path.unlink()
     except Exception as e:
         print(f"Error stopping daemon: {e}")
@@ -1039,20 +532,14 @@ def check_status():
 
     try:
         pid = int(pid_path.read_text().strip())
-
-        # Check if process is running
         os.kill(pid, 0)
 
         print(f"Daemon is running (PID: {pid})")
         print(f"Socket: {socket_path}")
 
-        # Try to connect to socket
         if socket_path.exists():
             print("Socket file exists")
-
-            # Try a simple connection test
             import socket as sock
-
             try:
                 test_sock = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
                 test_sock.connect(str(socket_path))
@@ -1068,7 +555,6 @@ def check_status():
 
     except ProcessLookupError:
         print("Daemon is not running (process not found)")
-        # Clean up stale PID file
         pid_path.unlink()
         return False
     except Exception as e:
