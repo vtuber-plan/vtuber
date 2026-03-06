@@ -24,6 +24,7 @@ from vtuber.config import (
     get_db_path,
     get_persona_path,
     get_user_path,
+    get_heartbeat_path,
 )
 from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.memory import log_message, create_session_id
@@ -61,6 +62,7 @@ class DaemonServer:
         self._heartbeat_task: asyncio.Task | None = None
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._task_consumer: asyncio.Task | None = None
+        self._agent_lock: asyncio.Lock = asyncio.Lock()
         self.heartbeat_interval: int = 5  # Minutes between heartbeats
         self.session_id: str = create_session_id()
 
@@ -91,10 +93,6 @@ class DaemonServer:
         self._task_consumer = asyncio.create_task(self._process_scheduled_tasks())
         print("Scheduler started")
 
-        # Start heartbeat timer
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        print(f"Heartbeat started (every {self.heartbeat_interval} minutes)")
-
         # Initialize agent
         await self._initialize_agent()
         print("Agent initialized")
@@ -105,6 +103,10 @@ class DaemonServer:
             path=str(self.socket_path),
         )
         self.is_running = True
+
+        # Start heartbeat timer after is_running is set so the loop condition works
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        print(f"Heartbeat started (every {self.heartbeat_interval} minutes)")
 
         # Write PID file
         pid_path = get_pid_path()
@@ -148,6 +150,7 @@ class DaemonServer:
                 mcp_servers={"vtuber-tools": tools_server},
                 allowed_tools=allowed_tools,
                 permission_mode="bypassPermissions",
+                cli_path="ripperdoc",
             )
             subagent = ClaudeSDKClient(options)
             await subagent.connect()
@@ -217,6 +220,7 @@ class DaemonServer:
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
+            cli_path="ripperdoc",
         )
         self.agent = ClaudeSDKClient(options)
         await self.agent.connect()
@@ -307,45 +311,46 @@ class DaemonServer:
         log_message(self.session_id, "user", content)
 
         try:
-            # Send message to agent
-            stream_id = f"stream_{id(writer)}"
-            index = 0
-            assistant_text = ""
+            # Send message to agent (acquire lock to prevent concurrent agent access)
+            async with self._agent_lock:
+                stream_id = f"stream_{id(writer)}"
+                index = 0
+                assistant_text = ""
 
-            await self.agent.query(content)
-            async for msg in self.agent.receive_response():
-                text = extract_stream_text(msg)
-                if text:
-                    assistant_text += text
-                    response = encode_message(
-                        {
-                            "type": "assistant_message",
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": text,
-                            "is_final": False,
-                        }
-                    )
-                    # Broadcast to all clients
-                    await self._broadcast(response)
-                    index += 1
+                await self.agent.query(content)
+                async for msg in self.agent.receive_response():
+                    text = extract_stream_text(msg)
+                    if text:
+                        assistant_text += text
+                        response = encode_message(
+                            {
+                                "type": "assistant_message",
+                                "stream_id": stream_id,
+                                "index": index,
+                                "content": text,
+                                "is_final": False,
+                            }
+                        )
+                        # Broadcast to all clients
+                        await self._broadcast(response)
+                        index += 1
 
-                elif isinstance(msg, ResultMessage):
-                    # Message complete
-                    response = encode_message(
-                        {
-                            "type": "assistant_message",
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": "",
-                            "is_final": True,
-                        }
-                    )
-                    await self._broadcast(response)
+                    elif isinstance(msg, ResultMessage):
+                        # Message complete
+                        response = encode_message(
+                            {
+                                "type": "assistant_message",
+                                "stream_id": stream_id,
+                                "index": index,
+                                "content": "",
+                                "is_final": True,
+                            }
+                        )
+                        await self._broadcast(response)
 
-            # Log assistant response to session
-            if assistant_text.strip():
-                log_message(self.session_id, "assistant", assistant_text.strip())
+                # Log assistant response to session
+                if assistant_text.strip():
+                    log_message(self.session_id, "assistant", assistant_text.strip())
 
         except Exception as e:
             print(f"Error handling message: {e}")
@@ -384,8 +389,6 @@ class DaemonServer:
 
         try:
             # Read heartbeat tasks
-            from vtuber.config import get_heartbeat_path
-
             heartbeat_path = get_heartbeat_path()
             heartbeat_content = ""
 
@@ -405,45 +408,44 @@ class DaemonServer:
             heartbeat_msg += "- Initiate a conversation with the user\n"
             heartbeat_msg += "- Or simply respond with 'HEARTBEAT_OK' if everything is fine."
 
-            # Send heartbeat to agent
-            stream_id = f"heartbeat_{asyncio.get_event_loop().time()}"
-            index = 0
-            collected_text = ""
+            # Send heartbeat to agent (acquire lock to prevent concurrent agent access)
+            async with self._agent_lock:
+                stream_id = f"heartbeat_{asyncio.get_running_loop().time()}"
+                collected_text = ""
 
-            await self.agent.query(heartbeat_msg)
-            async for msg in self.agent.receive_response():
-                text = extract_stream_text(msg)
-                if text:
-                    collected_text += text
-                    # Only broadcast if it's not just "HEARTBEAT_OK"
-                    if "HEARTBEAT_OK" not in collected_text.upper():
-                        response = encode_message(
-                            {
-                                "type": "assistant_message",
-                                "stream_id": stream_id,
-                                "index": index,
-                                "content": text,
-                                "is_final": False,
-                            }
-                        )
-                        await self._broadcast(response)
-                    index += 1
+                await self.agent.query(heartbeat_msg)
+                async for msg in self.agent.receive_response():
+                    text = extract_stream_text(msg)
+                    if text:
+                        collected_text += text
 
-                elif isinstance(msg, ResultMessage):
-                    # Only send final if agent said something non-heartbeat
-                    if index > 0 and "HEARTBEAT_OK" not in collected_text.upper():
-                        response = encode_message(
-                            {
-                                "type": "assistant_message",
-                                "stream_id": stream_id,
-                                "index": index,
-                                "content": "",
-                                "is_final": True,
-                            }
-                        )
-                        await self._broadcast(response)
+                    elif isinstance(msg, ResultMessage):
+                        pass
 
-            print("Heartbeat sent to agent")
+            # After collecting all text, decide whether to broadcast
+            if collected_text.strip() and "HEARTBEAT_OK" not in collected_text.upper():
+                response = encode_message(
+                    {
+                        "type": "heartbeat_message",
+                        "stream_id": stream_id,
+                        "index": 0,
+                        "content": collected_text,
+                        "is_final": False,
+                    }
+                )
+                await self._broadcast(response)
+                final_response = encode_message(
+                    {
+                        "type": "heartbeat_message",
+                        "stream_id": stream_id,
+                        "index": 1,
+                        "content": "",
+                        "is_final": True,
+                    }
+                )
+                await self._broadcast(final_response)
+
+            print("Heartbeat completed")
 
         except Exception as e:
             print(f"Error sending heartbeat: {e}")

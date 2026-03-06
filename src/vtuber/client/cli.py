@@ -32,6 +32,7 @@ class CLIClient:
         self.writer: asyncio.StreamWriter | None = None
         self.running = False
         self._msg_queue: asyncio.Queue = asyncio.Queue()
+        self._pending_heartbeats: list[str] = []
         self._reader_task: asyncio.Task | None = None
 
         # Setup prompt with history
@@ -138,15 +139,32 @@ class CLIClient:
 
     async def _drain_pending(self):
         """Display any unsolicited messages queued while user was typing."""
+        # Show heartbeat messages that arrived during _wait_for_response
+        for hb in self._pending_heartbeats:
+            console.print(
+                Panel(
+                    Markdown(hb.strip()),
+                    title="[bold cyan]AI[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                )
+            )
+        self._pending_heartbeats.clear()
+
         while not self._msg_queue.empty():
             try:
                 msg = self._msg_queue.get_nowait()
                 msg_type = msg.get("type")
-                if msg_type in ("assistant_message", "task_message"):
-                    content = msg.get("content", "")
+                content = msg.get("content", "")
+                if msg_type in ("assistant_message", "task_message", "heartbeat_message"):
                     is_final = msg.get("is_final", False)
                     if content and is_final:
-                        label = "Task" if msg_type == "task_message" else "AI"
+                        labels = {
+                            "assistant_message": "AI",
+                            "task_message": "Task",
+                            "heartbeat_message": "AI",
+                        }
+                        label = labels.get(msg_type, "AI")
                         console.print(
                             Panel(
                                 Markdown(content.strip()),
@@ -157,7 +175,7 @@ class CLIClient:
                         )
                 elif msg_type == "error":
                     console.print(
-                        f"[bold red]错误：[/bold red]{msg.get('content', '')}"
+                        f"[bold red]错误：[/bold red]{content}"
                     )
             except asyncio.QueueEmpty:
                 break
@@ -191,6 +209,13 @@ class CLIClient:
 
                     if is_final:
                         break
+
+                elif msg_type == "heartbeat_message":
+                    # Heartbeat arrived while waiting — queue for drain later
+                    content = msg.get("content", "")
+                    if content:
+                        self._pending_heartbeats.append(content)
+                    continue
 
                 elif msg_type == "error":
                     console.print(
