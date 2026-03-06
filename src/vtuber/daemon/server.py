@@ -20,7 +20,8 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 
-from vtuber.daemon.protocol import decode_message, encode_message
+from vtuber.daemon.gateway import Gateway, ProviderConnection
+from vtuber.daemon.protocol import decode_message, encode_message, MessageType
 from vtuber.daemon.scheduler import TaskScheduler
 from vtuber.persona import build_system_prompt
 from vtuber.config import (
@@ -123,12 +124,12 @@ def _create_tools_server(include_schedule: bool = True):
 
 
 class DaemonServer:
-    """Unix Domain Socket server that manages client connections and agent sessions."""
+    """Unix Domain Socket server that manages provider connections and agent sessions."""
 
     def __init__(self, socket_path: Path | None = None):
         self.socket_path = socket_path or get_socket_path()
         self.is_running = False
-        self.clients: list[asyncio.StreamWriter] = []
+        self.gateway: Gateway = Gateway()
         self.agent: ClaudeSDKClient | None = None
         self.scheduler: TaskScheduler | None = None
         self.conversation_history: list[dict[str, Any]] = []
@@ -139,6 +140,8 @@ class DaemonServer:
         self._agent_lock: asyncio.Lock = asyncio.Lock()
         self.heartbeat_interval: int = 5  # Minutes between heartbeats
         self.session_id: str = create_session_id()
+        # Track which provider_id initiated the current agent request
+        self._pending_writers: dict[str, asyncio.StreamWriter] = {}
 
     async def start(self):
         """Start the daemon server."""
@@ -240,19 +243,18 @@ class DaemonServer:
 
                 tool_name = extract_tool_use_start(msg)
                 if tool_name:
-                    progress = encode_message({
-                        "type": "progress",
+                    await self.gateway.broadcast({
+                        "type": MessageType.PROGRESS,
                         "tool": tool_name,
                     })
-                    await self._broadcast(progress)
                     continue
 
                 text = extract_stream_text(msg)
                 if text:
-                    # Stream result to all clients
-                    response = encode_message(
+                    # Stream result to all providers
+                    await self.gateway.broadcast(
                         {
-                            "type": "task_message",
+                            "type": MessageType.TASK_MESSAGE,
                             "stream_id": stream_id,
                             "index": index,
                             "content": text,
@@ -260,14 +262,13 @@ class DaemonServer:
                             "is_final": False,
                         }
                     )
-                    await self._broadcast(response)
                     index += 1
 
                 elif isinstance(msg, ResultMessage):
                     # Send final message
-                    response = encode_message(
+                    await self.gateway.broadcast(
                         {
-                            "type": "task_message",
+                            "type": MessageType.TASK_MESSAGE,
                             "stream_id": stream_id,
                             "index": index,
                             "content": "",
@@ -275,22 +276,20 @@ class DaemonServer:
                             "is_final": True,
                         }
                     )
-                    await self._broadcast(response)
 
             await subagent.disconnect()
             logger.info("[schedule] completed: %s", _truncate(task_prompt))
 
         except Exception as e:
             logger.error("[schedule] failed: %s — %s", _truncate(task_prompt), e, exc_info=True)
-            # Notify clients of error
-            error_msg = encode_message(
+            # Notify providers of error
+            await self.gateway.broadcast(
                 {
-                    "type": "error",
+                    "type": MessageType.ERROR,
                     "content": f"Error executing task '{task_prompt}': {str(e)}",
                     "is_final": True,
                 }
             )
-            await self._broadcast(error_msg)
 
     async def _initialize_agent(self):
         """Initialize the main Claude SDK client with persona and user profile."""
@@ -314,15 +313,20 @@ class DaemonServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        """Handle a new client connection."""
+        """Handle a new client connection.
+
+        The client must send a 'register' message first to identify itself.
+        Unregistered connections can still send ping/pong but not user messages.
+        """
         addr = writer.get_extra_info("peername") or "client"
-        logger.info("Client connected: %s (total=%d)", addr, len(self.clients) + 1)
-        self.clients.append(writer)
+        provider_id: str | None = None
+
+        # Keep writer reference so we can respond before registration
+        self._pending_writers[id(writer)] = writer
 
         try:
             buffer = ""
             while self.is_running:
-                # Read data from client
                 try:
                     data = await reader.read(4096)
                     if not data:
@@ -330,11 +334,18 @@ class DaemonServer:
 
                     buffer += data.decode("utf-8")
 
-                    # Process complete messages (newline-delimited)
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         if line.strip():
-                            await self._process_message(line, writer)
+                            await self._process_message(
+                                line, writer, provider_id
+                            )
+                            # Check if registration happened
+                            if provider_id is None:
+                                for pid, conn in self.gateway.connections.items():
+                                    if conn.writer is writer:
+                                        provider_id = pid
+                                        break
 
                 except asyncio.CancelledError:
                     break
@@ -342,32 +353,44 @@ class DaemonServer:
                     logger.error("Error reading from client: %s", e)
                     break
         finally:
-            # Remove client from list
-            if writer in self.clients:
-                self.clients.remove(writer)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            logger.info("Client disconnected: %s (remaining=%d)", addr, len(self.clients))
+            self._pending_writers.pop(id(writer), None)
+            if provider_id:
+                await self.gateway.unregister(provider_id)
+            else:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                logger.info("Unregistered client disconnected: %s", addr)
 
     async def _process_message(
-        self, line: str, writer: asyncio.StreamWriter
+        self, line: str, writer: asyncio.StreamWriter, provider_id: str | None
     ):
-        """Process a message from a client."""
+        """Process a message from a provider."""
         try:
             msg = decode_message(line)
             msg_type = msg.get("type")
 
-            if msg_type == "user_message":
-                # User message - send to agent
-                content = msg.get("content", "")
-                await self._handle_user_message(content, writer)
+            if msg_type == MessageType.REGISTER:
+                # Provider registration
+                conn = ProviderConnection(
+                    provider_type=msg.get("provider", "unknown"),
+                    provider_id=msg.get("provider_id", f"anon-{id(writer)}"),
+                    writer=writer,
+                )
+                await self.gateway.register(conn)
 
-            elif msg_type == "ping":
-                # Ping - respond with pong
-                response = encode_message({"type": "pong", "is_final": True})
+            elif msg_type == MessageType.USER_MESSAGE:
+                content = msg.get("content", "")
+                pid = provider_id or msg.get("provider_id")
+                if pid:
+                    await self._handle_user_message(content, pid)
+                else:
+                    logger.warning("User message from unregistered provider, ignoring")
+
+            elif msg_type == MessageType.PING:
+                response = encode_message({"type": MessageType.PONG, "is_final": True})
                 writer.write(response.encode("utf-8"))
                 await writer.drain()
 
@@ -379,18 +402,14 @@ class DaemonServer:
         except Exception as e:
             logger.error("Error processing message: %s", e, exc_info=True)
 
-    async def _handle_user_message(self, content: str, writer: asyncio.StreamWriter):
-        """Handle a user message by sending it to the agent and streaming the response."""
+    async def _handle_user_message(self, content: str, provider_id: str):
+        """Handle a user message by sending it to the agent and routing the response."""
         if not self.agent:
-            error_msg = encode_message(
-                {
-                    "type": "error",
-                    "content": "Agent not initialized",
-                    "is_final": True,
-                }
-            )
-            writer.write(error_msg.encode("utf-8"))
-            await writer.drain()
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": "Agent not initialized",
+                "is_final": True,
+            })
             return
 
         # Log user message to session
@@ -398,9 +417,8 @@ class DaemonServer:
         logger.info("[user] %s", _truncate(content))
 
         try:
-            # Send message to agent (acquire lock to prevent concurrent agent access)
             async with self._agent_lock:
-                stream_id = f"stream_{id(writer)}"
+                stream_id = f"stream_{provider_id}"
                 index = 0
                 assistant_text = ""
 
@@ -408,60 +426,45 @@ class DaemonServer:
                 async for msg in self.agent.receive_response():
                     _log_stream_event(msg, "agent")
 
-                    # Forward tool call progress to clients
                     tool_name = extract_tool_use_start(msg)
                     if tool_name:
-                        progress = encode_message({
-                            "type": "progress",
+                        await self.gateway.send_to(provider_id, {
+                            "type": MessageType.PROGRESS,
                             "tool": tool_name,
                         })
-                        await self._broadcast(progress)
                         continue
 
                     text = extract_stream_text(msg)
                     if text:
                         assistant_text += text
-                        response = encode_message(
-                            {
-                                "type": "assistant_message",
-                                "stream_id": stream_id,
-                                "index": index,
-                                "content": text,
-                                "is_final": False,
-                            }
-                        )
-                        # Broadcast to all clients
-                        await self._broadcast(response)
+                        await self.gateway.send_to(provider_id, {
+                            "type": MessageType.ASSISTANT_MESSAGE,
+                            "stream_id": stream_id,
+                            "index": index,
+                            "content": text,
+                            "is_final": False,
+                        })
                         index += 1
 
                     elif isinstance(msg, ResultMessage):
-                        # Message complete
-                        response = encode_message(
-                            {
-                                "type": "assistant_message",
-                                "stream_id": stream_id,
-                                "index": index,
-                                "content": "",
-                                "is_final": True,
-                            }
-                        )
-                        await self._broadcast(response)
+                        await self.gateway.send_to(provider_id, {
+                            "type": MessageType.ASSISTANT_MESSAGE,
+                            "stream_id": stream_id,
+                            "index": index,
+                            "content": "",
+                            "is_final": True,
+                        })
 
-                # Log assistant response to session
                 if assistant_text.strip():
                     log_message(self.session_id, "assistant", assistant_text.strip())
 
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
-            error_msg = encode_message(
-                {
-                    "type": "error",
-                    "content": str(e),
-                    "is_final": True,
-                }
-            )
-            writer.write(error_msg.encode("utf-8"))
-            await writer.drain()
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": str(e),
+                "is_final": True,
+            })
 
     async def _heartbeat_loop(self):
         """Periodic heartbeat loop."""
@@ -531,26 +534,24 @@ class DaemonServer:
             # After collecting all text, decide whether to broadcast
             if collected_text.strip() and "HEARTBEAT_OK" not in collected_text.upper():
                 logger.info("[heartbeat] agent responded: %s", _truncate(collected_text))
-                response = encode_message(
+                await self.gateway.broadcast(
                     {
-                        "type": "heartbeat_message",
+                        "type": MessageType.HEARTBEAT_MESSAGE,
                         "stream_id": stream_id,
                         "index": 0,
                         "content": collected_text,
                         "is_final": False,
                     }
                 )
-                await self._broadcast(response)
-                final_response = encode_message(
+                await self.gateway.broadcast(
                     {
-                        "type": "heartbeat_message",
+                        "type": MessageType.HEARTBEAT_MESSAGE,
                         "stream_id": stream_id,
                         "index": 1,
                         "content": "",
                         "is_final": True,
                     }
                 )
-                await self._broadcast(final_response)
             else:
                 logger.info("[heartbeat] agent replied HEARTBEAT_OK")
 
@@ -558,26 +559,6 @@ class DaemonServer:
 
         except Exception as e:
             logger.error("[heartbeat] error: %s", e, exc_info=True)
-
-    async def _broadcast(self, message: str):
-        """Broadcast a message to all connected clients."""
-        if not self.clients:
-            return
-
-        # Send to all clients
-        disconnected = []
-        for writer in self.clients:
-            try:
-                writer.write(message.encode("utf-8"))
-                await writer.drain()
-            except Exception as e:
-                logger.error("Error broadcasting to client: %s", e)
-                disconnected.append(writer)
-
-        # Remove disconnected clients
-        for writer in disconnected:
-            if writer in self.clients:
-                self.clients.remove(writer)
 
     async def shutdown(self):
         """Shutdown the daemon server gracefully."""
@@ -609,14 +590,8 @@ class DaemonServer:
             except Exception:
                 pass
 
-        # Close all client connections
-        for writer in self.clients:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-        self.clients.clear()
+        # Close all provider connections
+        await self.gateway.close_all()
 
         # Shutdown scheduler
         if self.scheduler:
