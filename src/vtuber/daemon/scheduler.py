@@ -18,4 +18,4 @@ class TaskScheduler:
 
     def shutdown(self):
         """Shutdown the scheduler."""
-        self.scheduler.shutdown()
+        self.scheduler.shutdown(wait=False)

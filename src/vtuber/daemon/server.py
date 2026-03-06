@@ -193,7 +193,7 @@ class DaemonServer:
                      self.socket_path, os.getpid(), self.session_id)
 
         # Setup signal handlers
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
@@ -325,17 +325,18 @@ class DaemonServer:
         self._pending_writers[id(writer)] = writer
 
         try:
-            buffer = ""
+            buffer = b""
             while self.is_running:
                 try:
                     data = await reader.read(4096)
                     if not data:
                         break
 
-                    buffer += data.decode("utf-8")
+                    buffer += data
 
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
+                    while b"\n" in buffer:
+                        raw_line, buffer = buffer.split(b"\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace")
                         if line.strip():
                             await self._process_message(
                                 line, writer, provider_id
@@ -675,6 +676,7 @@ def start_daemon_background():
             stdin=subprocess.DEVNULL,
             start_new_session=True,  # Detach from terminal
         )
+        log_file.close()  # Child inherits the fd; parent must close its copy
         print("Daemon started in background")
         print(f"Log: {log_path}")
 

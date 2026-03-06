@@ -130,7 +130,7 @@ async def _run_phase(
     console.print()
     console.print(f"[bold]{prompt_text}[/bold]")
 
-    user_input = prompt_session.prompt(
+    user_input = await prompt_session.prompt_async(
         HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
     )
 
@@ -138,7 +138,7 @@ async def _run_phase(
 
     while not target_path.exists():
         try:
-            user_reply = prompt_session.prompt(
+            user_reply = await prompt_session.prompt_async(
                 HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
             )
         except (EOFError, KeyboardInterrupt):

@@ -91,7 +91,7 @@ class Provider(ABC):
         """Background task: read from socket and dispatch messages."""
         if not self.reader:
             return
-        buffer = ""
+        buffer = b""
         try:
             while self.running:
                 data = await self.reader.read(4096)
@@ -99,9 +99,10 @@ class Provider(ABC):
                     self.running = False
                     await self.on_disconnected()
                     break
-                buffer += data.decode("utf-8")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
+                buffer += data
+                while b"\n" in buffer:
+                    raw_line, buffer = buffer.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace")
                     if line.strip():
                         try:
                             msg = decode_message(line)

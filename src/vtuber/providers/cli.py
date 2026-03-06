@@ -84,32 +84,58 @@ class CLIProvider(Provider):
             )
         self._pending_heartbeats.clear()
 
+        # Accumulate streamed chunks by message type
+        collected: dict[str, str] = {}
+
         while not self._msg_queue.empty():
             try:
                 msg = self._msg_queue.get_nowait()
                 msg_type = msg.get("type")
                 content = msg.get("content", "")
+
                 if msg_type in ("assistant_message", "task_message", "heartbeat_message"):
                     is_final = msg.get("is_final", False)
-                    if content and is_final:
-                        labels = {
-                            "assistant_message": "Agent",
-                            "task_message": "Task",
-                            "heartbeat_message": "Agent",
-                        }
-                        label = labels.get(msg_type, "Agent")
-                        console.print(
-                            Panel(
-                                Markdown(content.strip()),
-                                title=f"[bold cyan]{label}[/bold cyan]",
-                                border_style="cyan",
-                                padding=(1, 2),
+                    if content:
+                        collected[msg_type] = collected.get(msg_type, "") + content
+                    if is_final:
+                        text = collected.pop(msg_type, "")
+                        if text.strip():
+                            labels = {
+                                "assistant_message": "Agent",
+                                "task_message": "Task",
+                                "heartbeat_message": "Agent",
+                            }
+                            label = labels.get(msg_type, "Agent")
+                            console.print(
+                                Panel(
+                                    Markdown(text.strip()),
+                                    title=f"[bold cyan]{label}[/bold cyan]",
+                                    border_style="cyan",
+                                    padding=(1, 2),
+                                )
                             )
-                        )
                 elif msg_type == "error":
                     console.print(f"[bold red]{content}[/bold red]")
             except asyncio.QueueEmpty:
                 break
+
+        # Show any incomplete streams (no final message received yet)
+        labels = {
+            "assistant_message": "Agent",
+            "task_message": "Task",
+            "heartbeat_message": "Agent",
+        }
+        for msg_type, text in collected.items():
+            if text.strip():
+                label = labels.get(msg_type, "Agent")
+                console.print(
+                    Panel(
+                        Markdown(text.strip()),
+                        title=f"[bold cyan]{label}[/bold cyan]",
+                        border_style="cyan",
+                        padding=(1, 2),
+                    )
+                )
 
     async def _wait_for_response(self):
         """Show spinner while collecting streamed response, then render panel."""
