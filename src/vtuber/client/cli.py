@@ -187,15 +187,23 @@ class CLIClient:
 
         spinner = Spinner("dots", text=Text(" 思考中...", style="dim"))
 
-        with Live(spinner, console=console, transient=True, refresh_per_second=12):
+        with Live(spinner, console=console, transient=True, refresh_per_second=12) as live:
             while True:
                 try:
-                    msg = await asyncio.wait_for(self._msg_queue.get(), timeout=120)
+                    msg = await asyncio.wait_for(self._msg_queue.get(), timeout=300)
                 except asyncio.TimeoutError:
-                    console.print("[yellow]响应超时[/yellow]")
+                    console.print("[yellow]响应超时（5分钟无活动）[/yellow]")
                     return
 
                 msg_type = msg.get("type")
+
+                if msg_type == "progress":
+                    # Agent is using a tool — update spinner, reset timeout
+                    tool = msg.get("tool", "")
+                    live.update(
+                        Spinner("dots", text=Text(f" 使用工具: {tool}", style="dim"))
+                    )
+                    continue
 
                 if msg_type in ("assistant_message", "task_message"):
                     content = msg.get("content", "")

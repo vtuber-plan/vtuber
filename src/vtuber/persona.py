@@ -9,26 +9,36 @@ TOOLS_SECTION = """## 内置能力
 
 你拥有 Claude 的全部内置工具（Read、Write、Edit、Bash、Grep、Glob 等），以及以下自定义工具：
 
-### 记忆系统
-- **search_sessions(query, limit)**: 搜索过往对话记录，按关键词查找历史消息
-- **list_sessions(limit)**: 列出最近的对话 session 及其摘要
-- **update_long_term_memory(content)**: 向长期记忆追加重要洞察（请克制使用，仅记录跨 session 有价值的模式和事实）
+### 对话记忆
+- **search_sessions(query, limit)**: 搜索过往对话记录，返回匹配消息及上下文
+- **list_sessions(limit)**: 列出最近的对话 session 及话题预览
+- **read_session(session_id)**: 读取某次对话的完整内容
 
 ### 日程管理
 - **schedule_create(task_id, task, trigger_type, trigger_config)**: 创建定时任务
 - **schedule_list()**: 列出所有定时任务
 - **schedule_cancel(task_id)**: 取消定时任务
 
-## 关于记忆
+## 记忆管理
 
-### 短期记忆
-每次对话都会自动记录到 session log 中。你可以用 search_sessions 搜索历史对话。
+你有三层记忆，请善用它们：
 
-### 长期记忆
-你的长期记忆文件会被注入到这个系统提示中（见下方）。请只在有真正重要的、跨 session 的洞察时才更新长期记忆。
+### 1. 对话记录（自动）
+每轮对话自动记录到 session log。用 search_sessions / list_sessions / read_session 查询。
 
-### 用户档案
-你可以通过 Write 工具写入 {user_path} 来更新你对用户的了解。当你在对话中获得了关于用户的新信息（偏好、习惯、重要事件等），可以主动更新这个文件。
+### 2. 长期记忆（你维护）
+文件路径：`{long_term_memory_path}`
+该文件的内容会注入到你的系统提示中（见下方）。你可以直接用 Read/Write/Edit 工具管理它。
+
+维护原则：
+- 记录跨 session 有价值的模式、事实和洞察
+- **定期整理**：合并重复内容，删除过时信息，保持文件简洁
+- 按主题组织，不要按时间堆砌
+- 控制在合理长度内（建议不超过 200 行）
+
+### 3. 用户档案（你维护）
+文件路径：`{user_path}`
+当你在对话中获得关于用户的新信息（偏好、习惯、重要事件等），主动更新这个文件。
 
 请自然地使用这些能力来增强交互体验。"""
 
@@ -62,7 +72,10 @@ def build_system_prompt(persona_path: Path, user_path: Path) -> str:
     """Build system prompt from persona.md, user.md, long-term memory, and tools section."""
     persona_content = _read_or_default(persona_path, DEFAULT_PERSONA)
     user_content = _read_or_default(user_path, DEFAULT_USER)
-    tools_section = TOOLS_SECTION.format(user_path=str(get_user_path()))
+    tools_section = TOOLS_SECTION.format(
+        user_path=str(get_user_path()),
+        long_term_memory_path=str(get_long_term_memory_path()),
+    )
     long_term_memory = _read_long_term_memory()
 
     parts = [

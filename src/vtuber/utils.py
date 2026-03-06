@@ -25,3 +25,14 @@ def extract_stream_text(msg) -> str | None:
         return "".join(parts) if parts else None
 
     return None
+
+
+def extract_tool_use_start(msg) -> str | None:
+    """Extract tool name from a content_block_start StreamEvent, or None."""
+    if isinstance(msg, StreamEvent):
+        event = msg.event
+        if event.get("type") == "content_block_start":
+            block = event.get("content_block", {})
+            if block.get("type") == "tool_use":
+                return block.get("name")
+    return None

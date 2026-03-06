@@ -2,7 +2,7 @@ from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cance
 from vtuber.tools.memory import (
     search_sessions,
     list_sessions,
-    update_long_term_memory,
+    read_session,
     log_message,
     create_session_id,
 )
@@ -13,7 +13,7 @@ __all__ = [
     "schedule_cancel",
     "search_sessions",
     "list_sessions",
-    "update_long_term_memory",
+    "read_session",
     "log_message",
     "create_session_id",
 ]

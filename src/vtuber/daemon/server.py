@@ -35,7 +35,7 @@ from vtuber.config import (
 )
 from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.memory import log_message, create_session_id
-from vtuber.utils import extract_stream_text
+from vtuber.utils import extract_stream_text, extract_tool_use_start
 
 logger = logging.getLogger("vtuber.daemon")
 
@@ -107,10 +107,10 @@ def _log_stream_event(msg, source: str = "agent"):
 
 def _create_tools_server(include_schedule: bool = True):
     """Create an SDK MCP server with vtuber tools."""
-    from vtuber.tools.memory import search_sessions, list_sessions, update_long_term_memory
+    from vtuber.tools.memory import search_sessions, list_sessions, read_session
 
-    tools = [search_sessions, list_sessions, update_long_term_memory]
-    allowed = ["search_sessions", "list_sessions", "update_long_term_memory"]
+    tools = [search_sessions, list_sessions, read_session]
+    allowed = ["search_sessions", "list_sessions", "read_session"]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
@@ -237,6 +237,16 @@ class DaemonServer:
             await subagent.query(f"[Scheduled Task] {task_prompt}")
             async for msg in subagent.receive_response():
                 _log_stream_event(msg, "schedule")
+
+                tool_name = extract_tool_use_start(msg)
+                if tool_name:
+                    progress = encode_message({
+                        "type": "progress",
+                        "tool": tool_name,
+                    })
+                    await self._broadcast(progress)
+                    continue
+
                 text = extract_stream_text(msg)
                 if text:
                     # Stream result to all clients
@@ -397,6 +407,17 @@ class DaemonServer:
                 await self.agent.query(content)
                 async for msg in self.agent.receive_response():
                     _log_stream_event(msg, "agent")
+
+                    # Forward tool call progress to clients
+                    tool_name = extract_tool_use_start(msg)
+                    if tool_name:
+                        progress = encode_message({
+                            "type": "progress",
+                            "tool": tool_name,
+                        })
+                        await self._broadcast(progress)
+                        continue
+
                     text = extract_stream_text(msg)
                     if text:
                         assistant_text += text
@@ -495,6 +516,11 @@ class DaemonServer:
                 await self.agent.query(heartbeat_msg)
                 async for msg in self.agent.receive_response():
                     _log_stream_event(msg, "heartbeat")
+
+                    tool_name = extract_tool_use_start(msg)
+                    if tool_name:
+                        logger.debug("[heartbeat] using tool: %s", tool_name)
+
                     text = extract_stream_text(msg)
                     if text:
                         collected_text += text

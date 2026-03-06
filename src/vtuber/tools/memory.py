@@ -8,10 +8,11 @@ from typing import Any
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
-from vtuber.config import get_sessions_dir, get_long_term_memory_path, ensure_sessions_dir
+from vtuber.config import get_sessions_dir, ensure_sessions_dir
 
 
 # --- Helper functions (called by daemon, not tools) ---
+
 
 def create_session_id() -> str:
     """Create a timestamp-based session ID."""
@@ -31,21 +32,49 @@ def log_message(session_id: str, role: str, content: str) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _parse_session_file(path: Path) -> list[dict]:
+    """Parse a session JSONL file into a list of entries."""
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return entries
+
+
+def _session_preview(entries: list[dict], max_len: int = 100) -> str:
+    """Build a preview string from session entries."""
+    topics = []
+    for e in entries:
+        if e.get("role") == "user":
+            text = e.get("content", "").replace("\n", " ").strip()
+            if text:
+                topics.append(text[:max_len])
+            if len(topics) >= 3:
+                break
+    return " / ".join(topics) if topics else "(空)"
+
+
 # --- Tools for the AI ---
+
 
 @tool(
     "search_sessions",
-    "Search through past conversation session logs by keyword. Returns matching messages with timestamps and context.",
+    "Search past conversation sessions by keyword. Returns matching messages with surrounding context.",
     {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search keyword or phrase to look for in conversation history",
+                "description": "Search keyword or phrase",
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of results to return (default: 10)",
+                "description": "Max results (default 10)",
             },
         },
         "required": ["query"],
@@ -53,7 +82,7 @@ def log_message(session_id: str, role: str, content: str) -> None:
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
-    """Search through session logs for matching messages."""
+    """Search through session logs for matching messages with context."""
     query = args["query"].lower()
     limit = args.get("limit", 10)
     sessions_dir = get_sessions_dir()
@@ -62,44 +91,57 @@ async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": "No session logs found."}]}
 
     results = []
-    # Sort session files by name (newest first since names are timestamps)
     session_files = sorted(sessions_dir.glob("*.jsonl"), reverse=True)
 
     for session_file in session_files:
         session_name = session_file.stem
-        try:
-            with open(session_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
-                    if query in entry.get("content", "").lower():
-                        results.append(
-                            f"[{session_name}] {entry['timestamp']} ({entry['role']}): {entry['content'][:200]}"
-                        )
-                        if len(results) >= limit:
-                            break
-        except (json.JSONDecodeError, KeyError):
-            continue
+        entries = _parse_session_file(session_file)
+
+        for i, entry in enumerate(entries):
+            content = entry.get("content", "")
+            if query not in content.lower():
+                continue
+
+            # Include surrounding context (1 message before, 1 after)
+            context_lines = []
+            if i > 0:
+                prev = entries[i - 1]
+                context_lines.append(
+                    f"  [{prev['role']}] {prev['content'][:150]}"
+                )
+            context_lines.append(
+                f"  **[{entry['role']}] {content[:300]}**"
+            )
+            if i + 1 < len(entries):
+                nxt = entries[i + 1]
+                context_lines.append(
+                    f"  [{nxt['role']}] {nxt['content'][:150]}"
+                )
+
+            results.append(
+                f"Session {session_name} ({entry.get('timestamp', '?')}):\n"
+                + "\n".join(context_lines)
+            )
+            if len(results) >= limit:
+                break
         if len(results) >= limit:
             break
 
     if not results:
         return {"content": [{"type": "text", "text": f"No matches found for '{args['query']}'."}]}
 
-    return {"content": [{"type": "text", "text": "\n\n".join(results)}]}
+    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
 
 
 @tool(
     "list_sessions",
-    "List recent conversation sessions with dates and first message preview.",
+    "List recent conversation sessions with message counts and topic previews.",
     {
         "type": "object",
         "properties": {
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of sessions to list (default: 10)",
+                "description": "Max sessions to list (default 10)",
             },
         },
         "required": [],
@@ -107,7 +149,7 @@ async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
-    """List recent conversation sessions."""
+    """List recent conversation sessions with previews."""
     limit = args.get("limit", 10)
     sessions_dir = get_sessions_dir()
 
@@ -119,63 +161,49 @@ async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
     if not session_files:
         return {"content": [{"type": "text", "text": "No session logs found."}]}
 
-    lines = ["Recent sessions:"]
+    lines = ["Recent sessions:\n"]
     for session_file in session_files:
-        session_name = session_file.stem
-        first_user_msg = ""
-        msg_count = 0
-        try:
-            with open(session_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    msg_count += 1
-                    entry = json.loads(line)
-                    if not first_user_msg and entry.get("role") == "user":
-                        first_user_msg = entry.get("content", "")[:80]
-        except (json.JSONDecodeError, KeyError):
-            continue
-        preview = first_user_msg if first_user_msg else "(empty)"
-        lines.append(f"- {session_name} ({msg_count} messages): {preview}")
+        entries = _parse_session_file(session_file)
+        preview = _session_preview(entries)
+        user_count = sum(1 for e in entries if e.get("role") == "user")
+        lines.append(f"- **{session_file.stem}** ({len(entries)} msgs, {user_count} from user): {preview}")
 
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
 
 @tool(
-    "update_long_term_memory",
-    "Append an insight or important note to long-term memory. Use sparingly — only for consolidated, important patterns and facts worth remembering across all future sessions. This is NOT for recording conversations.",
+    "read_session",
+    "Read the full content of a specific past conversation session.",
     {
         "type": "object",
         "properties": {
-            "content": {
+            "session_id": {
                 "type": "string",
-                "description": "The insight or note to remember permanently. Should be concise and self-contained.",
+                "description": "Session ID (filename without .jsonl, e.g. '2026-03-06_12-00-00')",
             },
         },
-        "required": ["content"],
+        "required": ["session_id"],
     },
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
-async def update_long_term_memory(args: dict[str, Any]) -> dict[str, Any]:
-    """Append to long-term memory file."""
-    content = args["content"]
-    memory_path = get_long_term_memory_path()
+async def read_session(args: dict[str, Any]) -> dict[str, Any]:
+    """Read a specific session's full conversation."""
+    session_id = args["session_id"]
+    sessions_dir = get_sessions_dir()
+    session_file = sessions_dir / f"{session_id}.jsonl"
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = f"\n## {timestamp}\n\n{content}\n"
+    if not session_file.exists():
+        return {"content": [{"type": "text", "text": f"Session '{session_id}' not found."}]}
 
-    # Create file with header if it doesn't exist
-    if not memory_path.exists():
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
-        memory_path.write_text(
-            "# Long-term Memory\n\nThis file contains consolidated insights and important notes.\n" + entry,
-            encoding="utf-8",
-        )
-    else:
-        with open(memory_path, "a", encoding="utf-8") as f:
-            f.write(entry)
+    entries = _parse_session_file(session_file)
+    if not entries:
+        return {"content": [{"type": "text", "text": f"Session '{session_id}' is empty."}]}
 
-    return {
-        "content": [{"type": "text", "text": f"Long-term memory updated: {content[:100]}..."}]
-    }
+    lines = [f"Session: {session_id} ({len(entries)} messages)\n"]
+    for entry in entries:
+        ts = entry.get("timestamp", "?")
+        role = entry.get("role", "?")
+        content = entry.get("content", "")
+        lines.append(f"[{ts}] **{role}**: {content}")
+
+    return {"content": [{"type": "text", "text": "\n\n".join(lines)}]}
