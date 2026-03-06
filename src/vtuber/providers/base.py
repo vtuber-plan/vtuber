@@ -69,11 +69,18 @@ class Provider(ABC):
             except Exception:
                 pass
 
-    async def send_message(self, content: str) -> None:
-        """Send a user message to the daemon."""
+    async def send_message(self, content: str, sender: str = "owner") -> None:
+        """Send a user message to the daemon.
+
+        Args:
+            content: The message text.
+            sender: Who sent this message. "owner" = the agent's primary user.
+                    In group chats, this could be another participant's name.
+        """
         await self._send({
             "type": MessageType.USER_MESSAGE,
             "content": content,
+            "sender": sender,
         })
 
     async def _send(self, msg: dict) -> None:

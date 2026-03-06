@@ -19,7 +19,7 @@ def create_session_id() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def log_message(session_id: str, role: str, content: str) -> None:
+def log_message(session_id: str, role: str, content: str, sender: str | None = None) -> None:
     """Append a message to the session log file."""
     sessions_dir = ensure_sessions_dir()
     log_file = sessions_dir / f"{session_id}.jsonl"
@@ -28,6 +28,8 @@ def log_message(session_id: str, role: str, content: str) -> None:
         "role": role,
         "content": content,
     }
+    if sender and sender != "owner":
+        entry["sender"] = sender
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

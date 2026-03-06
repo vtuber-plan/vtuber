@@ -396,9 +396,10 @@ class DaemonServer:
 
             elif msg_type == MessageType.USER_MESSAGE:
                 content = msg.get("content", "")
+                sender = msg.get("sender", "owner")
                 pid = provider_id or msg.get("provider_id")
                 if pid:
-                    await self._handle_user_message(content, pid)
+                    await self._handle_user_message(content, pid, sender)
                 else:
                     logger.warning("User message from unregistered provider, ignoring")
 
@@ -415,7 +416,7 @@ class DaemonServer:
         except Exception as e:
             logger.error("Error processing message: %s", e, exc_info=True)
 
-    async def _handle_user_message(self, content: str, provider_id: str):
+    async def _handle_user_message(self, content: str, provider_id: str, sender: str = "owner"):
         """Handle a user message by sending it to the agent and routing the response."""
         if not self.agent:
             await self.gateway.send_to(provider_id, {
@@ -426,8 +427,11 @@ class DaemonServer:
             return
 
         # Log user message to session
-        log_message(self.session_id, "user", content)
-        logger.debug("[user] %s", _truncate(content))
+        log_message(self.session_id, "user", content, sender=sender)
+        logger.debug("[%s] %s", sender, _truncate(content))
+
+        # For non-owner messages, prefix with sender name so the agent knows who's talking
+        query_content = content if sender == "owner" else f"[{sender}]: {content}"
 
         try:
             async with self._agent_lock:
@@ -435,7 +439,7 @@ class DaemonServer:
                 index = 0
                 assistant_text = ""
 
-                await self.agent.query(content)
+                await self.agent.query(query_content)
                 async for msg in self.agent.receive_response():
                     _log_stream_event(msg, "agent")
 
