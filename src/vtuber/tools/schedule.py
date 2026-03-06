@@ -64,8 +64,10 @@ async def scheduled_job_handler(task: str = ""):
                     "Trigger parameters passed to APScheduler. Examples:\n"
                     "- date: {\"run_date\": \"2026-07-22 09:00:00\"}\n"
                     "- interval: {\"hours\": 1} or {\"minutes\": 30}\n"
-                    "- cron: {\"month\": 7, \"day\": 22, \"hour\": 9} for yearly July 22 at 9am\n"
-                    "- cron: {\"hour\": 8, \"minute\": 0} for daily at 8am"
+                    "- cron: {\"hour\": 8, \"minute\": 0} for daily at 8am\n"
+                    "- cron: {\"day_of_week\": \"mon-fri\", \"hour\": 9} for weekdays at 9am\n"
+                    "Timezone: add \"timezone\": \"Asia/Shanghai\" to any trigger_config "
+                    "for timezone-aware scheduling (IANA timezone names)."
                 ),
             },
         },

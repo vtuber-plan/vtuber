@@ -158,22 +158,19 @@ class Provider(ABC):
         if msg_type == MessageType.ASSISTANT_MESSAGE:
             await self.on_response(
                 msg.get("content", ""),
-                msg.get("is_final", False),
+                done=msg.get("done", True),
             )
         elif msg_type == MessageType.PROGRESS:
             await self.on_progress(msg.get("tool", ""))
         elif msg_type == MessageType.ERROR:
             await self.on_error(msg.get("content", ""))
         elif msg_type == MessageType.HEARTBEAT_MESSAGE:
-            await self.on_heartbeat(
-                msg.get("content", ""),
-                msg.get("is_final", False),
-            )
+            await self.on_heartbeat(msg.get("content", ""))
         elif msg_type == MessageType.TASK_MESSAGE:
             await self.on_task(
                 msg.get("content", ""),
                 msg.get("task", ""),
-                msg.get("is_final", False),
+                done=msg.get("done", True),
             )
         elif msg_type == MessageType.PONG:
             pass  # silently ignore
@@ -181,8 +178,16 @@ class Provider(ABC):
     # ── Platform Callbacks (subclasses implement) ────────────────
 
     @abstractmethod
-    async def on_response(self, content: str, is_final: bool) -> None:
-        """Handle assistant response chunk or final message."""
+    async def on_response(self, content: str, *, done: bool) -> None:
+        """Handle assistant response segment.
+
+        Each call carries a complete, displayable text segment.
+
+        Args:
+            content: Text content (may be empty on the final signal).
+            done: False = display this segment, keep waiting for more.
+                  True  = response complete, stop waiting.
+        """
         ...
 
     @abstractmethod
@@ -196,13 +201,20 @@ class Provider(ABC):
         ...
 
     @abstractmethod
-    async def on_heartbeat(self, content: str, is_final: bool) -> None:
-        """Handle heartbeat message from agent."""
+    async def on_heartbeat(self, content: str) -> None:
+        """Handle heartbeat message from agent (always a single complete message)."""
         ...
 
     @abstractmethod
-    async def on_task(self, content: str, task: str, is_final: bool) -> None:
-        """Handle scheduled task result."""
+    async def on_task(self, content: str, task: str, *, done: bool) -> None:
+        """Handle scheduled task result.
+
+        Args:
+            content: Text content (may be empty on the final signal).
+            task: The task description.
+            done: False = display this segment, keep waiting.
+                  True  = task complete, stop waiting.
+        """
         ...
 
     async def on_disconnected(self) -> None:

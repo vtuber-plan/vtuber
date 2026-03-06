@@ -12,11 +12,12 @@ USAGE = """\
 [bold]用法：[/bold] vtuber <command>
 
 [bold]命令：[/bold]
-  [green]start[/green]     启动 daemon（后台运行）
-  [green]stop[/green]      停止 daemon
-  [green]status[/green]    查看 daemon 状态
-  [green]chat[/green]      连接 daemon 开始对话
-  [green]restart[/green]   重启 daemon
+  [green]start[/green]        启动 daemon（后台运行）
+  [green]stop[/green]         停止 daemon
+  [green]status[/green]       查看 daemon 状态
+  [green]chat[/green]         连接 daemon 开始对话
+  [green]mock-group[/green]   模拟群聊测试
+  [green]restart[/green]      重启 daemon
 """
 
 
@@ -40,6 +41,9 @@ def main():
     elif command == "chat":
         from vtuber.client.cli import main as cli_main
         cli_main()
+    elif command == "mock-group":
+        from vtuber.providers.mock_group import main as mock_main
+        mock_main()
     elif command == "restart":
         from vtuber.daemon.server import stop_daemon, start_daemon_background
         stop_daemon()

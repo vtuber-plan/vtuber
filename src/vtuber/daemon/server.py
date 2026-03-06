@@ -34,10 +34,14 @@ from vtuber.config import (
     get_persona_path,
     get_user_path,
     get_heartbeat_path,
+    get_history_path,
+    get_consolidation_state_path,
     get_log_path,
+    get_sessions_dir,
 )
 from vtuber.tools.schedule import set_scheduler, set_task_queue
-from vtuber.tools.memory import log_message, create_session_id
+from vtuber.tools.memory import log_message, create_session_id, append_history
+from vtuber.templates import DEFAULT_HEARTBEAT
 from vtuber.utils import extract_stream_text, extract_tool_use_start
 
 logger = logging.getLogger("vtuber.daemon")
@@ -109,10 +113,10 @@ def _log_stream_event(msg, source: str = "agent"):
 
 def _create_tools_server(include_schedule: bool = True):
     """Create an SDK MCP server with vtuber tools."""
-    from vtuber.tools.memory import search_sessions, list_sessions, read_session
+    from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
 
-    tools = [search_sessions, list_sessions, read_session]
-    allowed = ["search_sessions", "list_sessions", "read_session"]
+    tools = [search_sessions, list_sessions, read_session, search_history]
+    allowed = ["search_sessions", "list_sessions", "read_session", "search_history"]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
@@ -122,6 +126,66 @@ def _create_tools_server(include_schedule: bool = True):
 
     server = create_sdk_mcp_server("vtuber-tools", tools=tools)
     return server, allowed
+
+
+class GroupAgentManager:
+    """Manages per-channel persistent agents for group chats."""
+
+    def __init__(self):
+        self._agents: dict[str, ClaudeSDKClient] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def get_or_create(self, channel_id: str) -> ClaudeSDKClient:
+        """Get an existing agent for a channel, or create a new one."""
+        if channel_id not in self._agents:
+            agent = await self._create_agent(channel_id)
+            self._agents[channel_id] = agent
+            self._locks[channel_id] = asyncio.Lock()
+            logger.info("[group/%s] created persistent agent", channel_id)
+        return self._agents[channel_id]
+
+    def get_lock(self, channel_id: str) -> asyncio.Lock:
+        """Get the concurrency lock for a channel's agent."""
+        if channel_id not in self._locks:
+            self._locks[channel_id] = asyncio.Lock()
+        return self._locks[channel_id]
+
+    async def _create_agent(self, channel_id: str) -> ClaudeSDKClient:
+        """Create a new persistent agent for a group channel."""
+        persona_path = get_persona_path()
+        user_path = get_user_path()
+        system_prompt = build_system_prompt(persona_path, user_path)
+
+        tools_server, allowed_tools = _create_tools_server(include_schedule=False)
+        options = ClaudeAgentOptions(
+            system_prompt=(
+                f"{system_prompt}\n\n"
+                f"你正在参与一个群聊（频道: {channel_id}）。\n"
+                "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
+                "如果对话不需要你参与，请只回复: NO_RESPONSE\n"
+                "如果需要回复，直接回复内容即可，不要加任何前缀。"
+            ),
+            mcp_servers={"vtuber-tools": tools_server},
+            allowed_tools=allowed_tools,
+            permission_mode="bypassPermissions",
+            cli_path=get_config().cli_path,
+            cwd=str(ensure_workspace_dir()),
+            extra_args={"no-session-persistence": None},
+        )
+        agent = ClaudeSDKClient(options)
+        await agent.connect()
+        return agent
+
+    async def close_all(self):
+        """Disconnect all group agents."""
+        for channel_id, agent in self._agents.items():
+            try:
+                await agent.disconnect()
+                logger.info("[group/%s] agent disconnected", channel_id)
+            except Exception:
+                pass
+        self._agents.clear()
+        self._locks.clear()
 
 
 class DaemonServer:
@@ -139,8 +203,12 @@ class DaemonServer:
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._task_consumer: asyncio.Task | None = None
         self._agent_lock: asyncio.Lock = asyncio.Lock()
+        self.group_agents: GroupAgentManager = GroupAgentManager()
         self.heartbeat_interval: int = get_config().heartbeat_interval
         self.session_id: str = create_session_id()
+        self._message_count: int = 0
+        self._consolidation_running: bool = False
+        self._consolidation_task: asyncio.Task | None = None
         # Track which provider_id initiated the current agent request
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
 
@@ -265,7 +333,7 @@ class DaemonServer:
                             "index": index,
                             "content": text,
                             "task": task_prompt,
-                            "is_final": False,
+                            "done": False,
                         }
                     )
                     index += 1
@@ -279,7 +347,7 @@ class DaemonServer:
                             "index": index,
                             "content": "",
                             "task": task_prompt,
-                            "is_final": True,
+                            "done": True,
                         }
                     )
 
@@ -293,7 +361,6 @@ class DaemonServer:
                 {
                     "type": MessageType.ERROR,
                     "content": f"Error executing task '{task_prompt}': {str(e)}",
-                    "is_final": True,
                 }
             )
 
@@ -306,18 +373,19 @@ class DaemonServer:
 
         # Create agent with all Claude Code tools + custom vtuber tools
         options = ClaudeAgentOptions(
-            # system_prompt=system_prompt,
-            system_prompt={
-                "type": "preset",
-                "preset": "claude_code",  # Use Claude Code's system prompt
-                "append": system_prompt,
-            },
+            system_prompt=system_prompt,
+            # system_prompt={
+            #     "type": "preset",
+            #     "preset": "claude_code",  # Use Claude Code's system prompt
+            #     "append": system_prompt,
+            # },
             tools={"type": "preset", "preset": "claude_code"},
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
             cli_path=get_config().cli_path,
             cwd=str(ensure_workspace_dir()),
+            extra_args={"no-session-persistence": None},
         )
         self.agent = ClaudeSDKClient(options)
         await self.agent.connect()
@@ -415,7 +483,7 @@ class DaemonServer:
                     )
 
             elif msg_type == MessageType.PING:
-                response = encode_message({"type": MessageType.PONG, "is_final": True})
+                response = encode_message({"type": MessageType.PONG})
                 writer.write(response.encode("utf-8"))
                 await writer.drain()
 
@@ -435,7 +503,6 @@ class DaemonServer:
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
                 "content": "Agent not initialized",
-                "is_final": True,
             })
             return
 
@@ -450,12 +517,17 @@ class DaemonServer:
                 await self._stream_agent_response(
                     self.agent, query_content, provider_id, "agent",
                 )
+            # Track message count for auto-consolidation
+            self._message_count += 1
+            if self._message_count >= 50 and not self._consolidation_running:
+                self._consolidation_task = asyncio.create_task(
+                    self._trigger_consolidation()
+                )
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
                 "content": str(e),
-                "is_final": True,
             })
 
     async def _handle_group_message(
@@ -463,15 +535,12 @@ class DaemonServer:
         content: str,
         provider_id: str,
         sender: str,
-        is_owner: bool,  # noqa: ARG002 — reserved for Phase 2 per-group agents
+        is_owner: bool,  # noqa: ARG002
         *,
         channel_id: str | None = None,
         context: list[dict] | None = None,
     ):
-        """Handle a group chat message — routes to a temporary sub-agent.
-
-        In Phase 2 this will use per-channel persistent agents.
-        """
+        """Handle a group chat message — routes to a per-channel persistent agent."""
         channel_label = channel_id or "unknown"
         logger.debug("[group/%s] %s: %s", channel_label, sender, _truncate(content))
 
@@ -487,42 +556,19 @@ class DaemonServer:
         query_text = "\n".join(query_parts)
 
         try:
-            # Create a temporary sub-agent for this group interaction
-            persona_path = get_persona_path()
-            user_path = get_user_path()
-            system_prompt = build_system_prompt(persona_path, user_path)
+            agent = await self.group_agents.get_or_create(channel_label)
+            lock = self.group_agents.get_lock(channel_label)
 
-            tools_server, allowed_tools = _create_tools_server(include_schedule=False)
-            options = ClaudeAgentOptions(
-                system_prompt=(
-                    f"{system_prompt}\n\n"
-                    "You are responding to a group chat message. "
-                    "If the conversation does not need your response, "
-                    "reply with exactly: NO_RESPONSE"
-                ),
-                mcp_servers={"vtuber-tools": tools_server},
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",
-                cli_path=get_config().cli_path,
-                cwd=str(ensure_workspace_dir()),
-            )
-            subagent = ClaudeSDKClient(options)
-            await subagent.connect()
-
-            try:
+            async with lock:
                 await self._stream_agent_response(
-                    subagent, query_text, provider_id, f"group/{channel_label}",
+                    agent, query_text, provider_id, f"group/{channel_label}",
                     no_response_token="NO_RESPONSE",
                 )
-            finally:
-                await subagent.disconnect()
-
         except Exception as e:
             logger.error("[group/%s] error: %s", channel_label, e, exc_info=True)
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
                 "content": str(e),
-                "is_final": True,
             })
 
     async def _stream_agent_response(
@@ -562,13 +608,14 @@ class DaemonServer:
 
             text = extract_stream_text(msg)
             if text:
+                logger.debug("[%s] → sending text chunk: %s", log_source, _truncate(text))
                 assistant_text += text
                 await self.gateway.send_to(provider_id, {
                     "type": MessageType.ASSISTANT_MESSAGE,
                     "stream_id": stream_id,
                     "index": index,
                     "content": text,
-                    "is_final": False,
+                    "done": False,
                 })
                 index += 1
 
@@ -582,7 +629,7 @@ class DaemonServer:
                         "stream_id": stream_id,
                         "index": index,
                         "content": "",
-                        "is_final": True,
+                        "done": True,
                         "no_response": True,
                     })
                 else:
@@ -591,7 +638,7 @@ class DaemonServer:
                         "stream_id": stream_id,
                         "index": index,
                         "content": "",
-                        "is_final": True,
+                        "done": True,
                     })
 
         if assistant_text.strip():
@@ -617,39 +664,47 @@ class DaemonServer:
                 logger.error("Heartbeat error: %s", e, exc_info=True)
 
     async def _send_heartbeat(self):
-        """Send a heartbeat message to the agent."""
-        if not self.agent:
+        """Two-phase heartbeat: pre-check file content, then optionally call sub-agent."""
+        # Phase 1: Pre-check — skip LLM if HEARTBEAT.md is default/empty
+        heartbeat_path = get_heartbeat_path()
+        heartbeat_content = ""
+
+        if heartbeat_path.exists():
+            heartbeat_content = heartbeat_path.read_text(encoding="utf-8").strip()
+
+        if not heartbeat_content or heartbeat_content == DEFAULT_HEARTBEAT.strip():
+            logger.info("[heartbeat] skipped (default/empty HEARTBEAT.md)")
             return
 
+        # Phase 2: Execute — use a temp sub-agent (lighter than main agent)
+        logger.info("[heartbeat] tasks found, executing with sub-agent")
         try:
-            # Read heartbeat tasks
-            heartbeat_path = get_heartbeat_path()
-            heartbeat_content = ""
+            persona_path = get_persona_path()
+            user_path = get_user_path()
+            system_prompt = build_system_prompt(persona_path, user_path)
 
-            if heartbeat_path.exists():
-                heartbeat_content = heartbeat_path.read_text(encoding="utf-8").strip()
+            tools_server, allowed_tools = _create_tools_server(include_schedule=True)
+            options = ClaudeAgentOptions(
+                system_prompt=(
+                    f"{system_prompt}\n\n"
+                    "[HEARTBEAT] 请审查以下任务清单，决定是否有需要执行的任务。\n"
+                    "如果有任务需要执行，请执行它们并报告结果。\n"
+                    "如果没有需要执行的任务，请只回复空内容。"
+                ),
+                mcp_servers={"vtuber-tools": tools_server},
+                allowed_tools=allowed_tools,
+                permission_mode="bypassPermissions",
+                cli_path=get_config().cli_path,
+                cwd=str(ensure_workspace_dir()),
+            )
+            subagent = ClaudeSDKClient(options)
+            await subagent.connect()
 
-            # Create heartbeat message
-            heartbeat_msg = "[HEARTBEAT] "
-            if heartbeat_content:
-                heartbeat_msg += f"Available tasks:\n{heartbeat_content}\n\n"
-            else:
-                heartbeat_msg += "No specific tasks defined. "
+            collected_text = ""
 
-            heartbeat_msg += "What would you like to do? You can:\n"
-            heartbeat_msg += "- Check if there are any scheduled tasks (use schedule_list)\n"
-            heartbeat_msg += "- Search past conversations for context (use search_sessions)\n"
-            heartbeat_msg += "- Initiate a conversation with the user\n"
-            heartbeat_msg += "- Or simply respond with 'HEARTBEAT_OK' if everything is fine."
-
-            # Send heartbeat to agent (acquire lock to prevent concurrent agent access)
-            logger.info("[heartbeat] sending heartbeat to agent")
-            async with self._agent_lock:
-                stream_id = f"heartbeat_{asyncio.get_running_loop().time()}"
-                collected_text = ""
-
-                await self.agent.query(heartbeat_msg)
-                async for msg in self.agent.receive_response():
+            try:
+                await subagent.query(f"[Heartbeat Task Checklist]\n\n{heartbeat_content}")
+                async for msg in subagent.receive_response():
                     _log_stream_event(msg, "heartbeat")
 
                     tool_name = extract_tool_use_start(msg)
@@ -662,35 +717,131 @@ class DaemonServer:
 
                     elif isinstance(msg, ResultMessage):
                         pass
+            finally:
+                await subagent.disconnect()
 
-            # After collecting all text, decide whether to broadcast
-            if collected_text.strip() and "HEARTBEAT_OK" not in collected_text.upper():
+            # Broadcast if there's actionable output
+            if collected_text.strip():
                 logger.info("[heartbeat] agent responded: %s", _truncate(collected_text))
-                await self.gateway.broadcast(
-                    {
-                        "type": MessageType.HEARTBEAT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": 0,
-                        "content": collected_text,
-                        "is_final": False,
-                    }
-                )
-                await self.gateway.broadcast(
-                    {
-                        "type": MessageType.HEARTBEAT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": 1,
-                        "content": "",
-                        "is_final": True,
-                    }
-                )
+                await self.gateway.broadcast({
+                    "type": MessageType.HEARTBEAT_MESSAGE,
+                    "content": collected_text,
+                })
             else:
-                logger.info("[heartbeat] agent replied HEARTBEAT_OK")
+                logger.info("[heartbeat] agent found nothing to do")
 
             logger.info("[heartbeat] completed")
 
         except Exception as e:
             logger.error("[heartbeat] error: %s", e, exc_info=True)
+
+    async def _trigger_consolidation(self):
+        """Auto-consolidate session messages into long-term memory + history log.
+
+        Runs a temp sub-agent that reads the session log, updates
+        long_term_memory.md with new facts, and appends a summary to history.md.
+        """
+        self._consolidation_running = True
+        try:
+            session_path = get_sessions_dir() / f"{self.session_id}.jsonl"
+            if not session_path.exists():
+                return
+
+            # Read consolidation state (how many messages already consolidated)
+            state_path = get_consolidation_state_path()
+            last_consolidated = 0
+            if state_path.exists():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    if state.get("session_id") == self.session_id:
+                        last_consolidated = state.get("last_consolidated", 0)
+                except Exception:
+                    pass
+
+            # Read unconsolidated messages from session
+            lines = session_path.read_text(encoding="utf-8").strip().split("\n")
+            new_lines = lines[last_consolidated:]
+            if len(new_lines) < 20:
+                return  # Not enough new messages to justify consolidation
+
+            # Build a readable transcript of new messages
+            transcript_parts = []
+            for raw_line in new_lines:
+                try:
+                    entry = json.loads(raw_line)
+                    ts = entry.get("timestamp", "?")[:16]
+                    role = entry.get("role", "?")
+                    content = entry.get("content", "")[:500]
+                    transcript_parts.append(f"[{ts}] {role}: {content}")
+                except json.JSONDecodeError:
+                    continue
+
+            if not transcript_parts:
+                return
+
+            transcript = "\n".join(transcript_parts)
+
+            from vtuber.config import get_long_term_memory_path, get_history_path
+
+            memory_path = get_long_term_memory_path()
+            history_path = get_history_path()
+            current_memory = ""
+            if memory_path.exists():
+                current_memory = memory_path.read_text(encoding="utf-8").strip()
+
+            logger.info(
+                "[consolidation] starting: %d new messages (from %d)",
+                len(new_lines), last_consolidated,
+            )
+
+            # Create temp sub-agent for consolidation
+            options = ClaudeAgentOptions(
+                system_prompt=(
+                    "你是一个记忆整理助手。你的任务是：\n"
+                    f"1. 阅读下面的对话记录\n"
+                    f"2. 将有价值的长期事实更新到 {memory_path}\n"
+                    f"3. 在 {history_path} 末尾追加一段摘要（以 [YYYY-MM-DD HH:MM] 开头）\n\n"
+                    "长期记忆应该按主题组织，保持简洁（不超过200行）。\n"
+                    "历史摘要应该是2-5句话，概括对话中的关键事件和决策。\n"
+                    "不要删除长期记忆中已有的仍然有效的内容。"
+                ),
+                tools={"type": "preset", "preset": "claude_code"},
+                permission_mode="bypassPermissions",
+                cli_path=get_config().cli_path,
+                cwd=str(ensure_workspace_dir()),
+            )
+            subagent = ClaudeSDKClient(options)
+            await subagent.connect()
+
+            try:
+                query = (
+                    f"## 当前长期记忆\n\n{current_memory or '(空)'}\n\n"
+                    f"## 需要整理的对话记录\n\n{transcript}"
+                )
+                await subagent.query(query)
+                async for msg in subagent.receive_response():
+                    _log_stream_event(msg, "consolidation")
+                    if isinstance(msg, ResultMessage):
+                        break
+            finally:
+                await subagent.disconnect()
+
+            # Update consolidation state
+            total_consolidated = last_consolidated + len(new_lines)
+            state_path.write_text(
+                json.dumps({
+                    "session_id": self.session_id,
+                    "last_consolidated": total_consolidated,
+                }),
+                encoding="utf-8",
+            )
+            self._message_count = 0
+            logger.info("[consolidation] completed: consolidated up to message %d", total_consolidated)
+
+        except Exception as e:
+            logger.error("[consolidation] error: %s", e, exc_info=True)
+        finally:
+            self._consolidation_running = False
 
     async def shutdown(self):
         """Shutdown the daemon server gracefully."""
@@ -704,6 +855,14 @@ class DaemonServer:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop consolidation task
+        if self._consolidation_task and not self._consolidation_task.done():
+            self._consolidation_task.cancel()
+            try:
+                await self._consolidation_task
             except asyncio.CancelledError:
                 pass
 
@@ -721,6 +880,9 @@ class DaemonServer:
                 await self.agent.disconnect()
             except Exception:
                 pass
+
+        # Disconnect group agents
+        await self.group_agents.close_all()
 
         # Close all provider connections
         await self.gateway.close_all()

@@ -159,6 +159,16 @@ def get_long_term_memory_path() -> Path:
     return get_config_dir() / "long_term_memory.md"
 
 
+def get_history_path() -> Path:
+    """Get the append-only history log file path."""
+    return get_config_dir() / "history.md"
+
+
+def get_consolidation_state_path() -> Path:
+    """Get the consolidation state file path."""
+    return get_config_dir() / "consolidation_state.json"
+
+
 def get_log_path() -> Path:
     """Get the daemon log file path."""
     return get_config_dir() / "daemon.log"

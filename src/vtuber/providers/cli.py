@@ -38,11 +38,11 @@ class CLIProvider(Provider):
 
     # ── Provider callbacks ───────────────────────────────────────
 
-    async def on_response(self, content: str, is_final: bool) -> None:
+    async def on_response(self, content: str, *, done: bool) -> None:
         await self._msg_queue.put({
             "type": "assistant_message",
             "content": content,
-            "is_final": is_final,
+            "done": done,
         })
 
     async def on_progress(self, tool: str) -> None:
@@ -51,19 +51,18 @@ class CLIProvider(Provider):
     async def on_error(self, error: str) -> None:
         await self._msg_queue.put({"type": "error", "content": error})
 
-    async def on_heartbeat(self, content: str, is_final: bool) -> None:
+    async def on_heartbeat(self, content: str) -> None:
         await self._msg_queue.put({
             "type": "heartbeat_message",
             "content": content,
-            "is_final": is_final,
         })
 
-    async def on_task(self, content: str, task: str, is_final: bool) -> None:
+    async def on_task(self, content: str, task: str, *, done: bool) -> None:
         await self._msg_queue.put({
             "type": "task_message",
             "content": content,
             "task": task,
-            "is_final": is_final,
+            "done": done,
         })
 
     async def on_disconnected(self) -> None:
@@ -84,8 +83,11 @@ class CLIProvider(Provider):
             )
         self._pending_heartbeats.clear()
 
-        # Accumulate streamed chunks by message type
-        collected: dict[str, str] = {}
+        labels = {
+            "assistant_message": "Agent",
+            "task_message": "Task",
+            "heartbeat_message": "Agent",
+        }
 
         while not self._msg_queue.empty():
             try:
@@ -93,113 +95,85 @@ class CLIProvider(Provider):
                 msg_type = msg.get("type")
                 content = msg.get("content", "")
 
-                if msg_type in ("assistant_message", "task_message", "heartbeat_message"):
-                    is_final = msg.get("is_final", False)
-                    if content:
-                        collected[msg_type] = collected.get(msg_type, "") + content
-                    if is_final:
-                        text = collected.pop(msg_type, "")
-                        if text.strip():
-                            labels = {
-                                "assistant_message": "Agent",
-                                "task_message": "Task",
-                                "heartbeat_message": "Agent",
-                            }
-                            label = labels.get(msg_type, "Agent")
-                            console.print(
-                                Panel(
-                                    Markdown(text.strip()),
-                                    title=f"[bold cyan]{label}[/bold cyan]",
-                                    border_style="cyan",
-                                    padding=(1, 2),
-                                )
-                            )
+                if msg_type in labels and content.strip():
+                    console.print(
+                        Panel(
+                            Markdown(content.strip()),
+                            title=f"[bold cyan]{labels[msg_type]}[/bold cyan]",
+                            border_style="cyan",
+                            padding=(1, 2),
+                        )
+                    )
                 elif msg_type == "error":
                     console.print(f"[bold red]{content}[/bold red]")
             except asyncio.QueueEmpty:
                 break
 
-        # Show any incomplete streams (no final message received yet)
-        labels = {
-            "assistant_message": "Agent",
-            "task_message": "Task",
-            "heartbeat_message": "Agent",
-        }
-        for msg_type, text in collected.items():
-            if text.strip():
-                label = labels.get(msg_type, "Agent")
+    async def _wait_for_response(self):
+        """Show spinner while waiting for response, render each segment as a panel."""
+        collected = ""
+        label = "Agent"
+        done = False
+        next_spinner_text = " 思考中..."
+
+        while not done:
+            spinner = Spinner("dots", text=Text(next_spinner_text, style="dim"))
+            next_spinner_text = " 思考中..."
+
+            with Live(spinner, console=console, transient=True, refresh_per_second=12) as live:
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(
+                            self._msg_queue.get(), timeout=get_config().response_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        console.print("[yellow]响应超时（5分钟无活动）[/yellow]")
+                        return
+
+                    msg_type = msg.get("type")
+
+                    if msg_type == "progress":
+                        tool = msg.get("tool", "")
+                        live.update(
+                            Spinner("dots", text=Text(f" 使用工具: {tool}", style="dim"))
+                        )
+                        continue
+
+                    if msg_type in ("assistant_message", "task_message"):
+                        content = msg.get("content", "")
+                        if content:
+                            collected += content
+                        if msg_type == "task_message":
+                            label = "Task"
+                        done = msg.get("done", True)
+                        break
+
+                    elif msg_type == "heartbeat_message":
+                        content = msg.get("content", "")
+                        if content:
+                            self._pending_heartbeats.append(content)
+                        continue
+
+                    elif msg_type == "error":
+                        console.print(
+                            f"\n[bold red]{msg.get('content', '')}[/bold red]"
+                        )
+                        return
+
+                    elif msg_type == "pong":
+                        continue
+
+            if collected.strip():
                 console.print(
                     Panel(
-                        Markdown(text.strip()),
+                        Markdown(collected.strip()),
                         title=f"[bold cyan]{label}[/bold cyan]",
                         border_style="cyan",
                         padding=(1, 2),
                     )
                 )
-
-    async def _wait_for_response(self):
-        """Show spinner while collecting streamed response, then render panel."""
-        collected = ""
-        label = "Agent"
-
-        spinner = Spinner("dots", text=Text(" 思考中...", style="dim"))
-
-        with Live(spinner, console=console, transient=True, refresh_per_second=12) as live:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(
-                        self._msg_queue.get(), timeout=get_config().response_timeout
-                    )
-                except asyncio.TimeoutError:
-                    console.print("[yellow]响应超时（5分钟无活动）[/yellow]")
-                    return
-
-                msg_type = msg.get("type")
-
-                if msg_type == "progress":
-                    tool = msg.get("tool", "")
-                    live.update(
-                        Spinner("dots", text=Text(f" 使用工具: {tool}", style="dim"))
-                    )
-                    continue
-
-                if msg_type in ("assistant_message", "task_message"):
-                    content = msg.get("content", "")
-                    is_final = msg.get("is_final", False)
-
-                    if content:
-                        collected += content
-
-                    if msg_type == "task_message":
-                        label = "Task"
-
-                    if is_final:
-                        break
-
-                elif msg_type == "heartbeat_message":
-                    content = msg.get("content", "")
-                    if content:
-                        self._pending_heartbeats.append(content)
-                    continue
-
-                elif msg_type == "error":
-                    console.print(
-                        f"\n[bold red]{msg.get('content', '')}[/bold red]"
-                    )
-                    return
-
-                elif msg_type == "pong":
-                    continue
-
-        if collected.strip():
-            console.print(
-                Panel(
-                    Markdown(collected.strip()),
-                    title=f"[bold cyan]{label}[/bold cyan]",
-                    border_style="cyan",
-                    padding=(1, 2),
-                )
-            )
+                collected = ""
+                label = "Agent"
 
     # ── Main loop ────────────────────────────────────────────────
 

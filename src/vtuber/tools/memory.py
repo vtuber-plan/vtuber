@@ -8,7 +8,7 @@ from typing import Any
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
-from vtuber.config import get_sessions_dir, ensure_sessions_dir
+from vtuber.config import get_sessions_dir, ensure_sessions_dir, get_history_path
 
 
 # --- Helper functions (called by daemon, not tools) ---
@@ -209,3 +209,68 @@ async def read_session(args: dict[str, Any]) -> dict[str, Any]:
         lines.append(f"[{ts}] **{role}**: {content}")
 
     return {"content": [{"type": "text", "text": "\n\n".join(lines)}]}
+
+
+# --- History log helpers ---
+
+
+def append_history(entry: str) -> None:
+    """Append a timestamped entry to the history log file."""
+    history_path = get_history_path()
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(entry.rstrip() + "\n\n")
+
+
+@tool(
+    "search_history",
+    "Search the append-only history log (HISTORY.md) by keyword. "
+    "Each entry starts with [YYYY-MM-DD HH:MM]. Faster than searching session logs.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search keyword or phrase",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max results (default 20)",
+            },
+        },
+        "required": ["query"],
+    },
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def search_history(args: dict[str, Any]) -> dict[str, Any]:
+    """Search through the history log for matching entries."""
+    query = args["query"].lower()
+    limit = args.get("limit", 20)
+    history_path = get_history_path()
+
+    if not history_path.exists():
+        return {"content": [{"type": "text", "text": "No history log found."}]}
+
+    content = history_path.read_text(encoding="utf-8")
+    if not content.strip():
+        return {"content": [{"type": "text", "text": "History log is empty."}]}
+
+    # Split into entries (each starts with [YYYY-MM-DD HH:MM])
+    entries = []
+    current = ""
+    for line in content.split("\n"):
+        if line.startswith("[") and len(line) > 17 and line[17:18] == "]":
+            if current.strip():
+                entries.append(current.strip())
+            current = line
+        else:
+            current += "\n" + line
+    if current.strip():
+        entries.append(current.strip())
+
+    # Search
+    results = [e for e in entries if query in e.lower()][-limit:]
+
+    if not results:
+        return {"content": [{"type": "text", "text": f"No matches found for '{args['query']}' in history."}]}
+
+    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
