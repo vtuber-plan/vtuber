@@ -397,11 +397,22 @@ class DaemonServer:
             elif msg_type == MessageType.USER_MESSAGE:
                 content = msg.get("content", "")
                 sender = msg.get("sender", "owner")
+                is_owner = msg.get("is_owner", True)
+                is_private = msg.get("is_private", True)
+                channel_id = msg.get("channel_id")
+                context = msg.get("context")  # list[{sender, content}] or None
                 pid = provider_id or msg.get("provider_id")
-                if pid:
-                    await self._handle_user_message(content, pid, sender)
-                else:
+                if not pid:
                     logger.warning("User message from unregistered provider, ignoring")
+                elif is_private:
+                    await self._handle_private_message(
+                        content, pid, sender, is_owner,
+                    )
+                else:
+                    await self._handle_group_message(
+                        content, pid, sender, is_owner,
+                        channel_id=channel_id, context=context,
+                    )
 
             elif msg_type == MessageType.PING:
                 response = encode_message({"type": MessageType.PONG, "is_final": True})
@@ -416,8 +427,10 @@ class DaemonServer:
         except Exception as e:
             logger.error("Error processing message: %s", e, exc_info=True)
 
-    async def _handle_user_message(self, content: str, provider_id: str, sender: str = "owner"):
-        """Handle a user message by sending it to the agent and routing the response."""
+    async def _handle_private_message(
+        self, content: str, provider_id: str, sender: str, is_owner: bool,
+    ):
+        """Handle a private/DM message — routes to the main agent."""
         if not self.agent:
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
@@ -426,55 +439,17 @@ class DaemonServer:
             })
             return
 
-        # Log user message to session
         log_message(self.session_id, "user", content, sender=sender)
         logger.debug("[%s] %s", sender, _truncate(content))
 
-        # For non-owner messages, prefix with sender name so the agent knows who's talking
-        query_content = content if sender == "owner" else f"[{sender}]: {content}"
+        # Owner messages go directly; non-owner DMs get a sender prefix
+        query_content = content if is_owner else f"[{sender}]: {content}"
 
         try:
             async with self._agent_lock:
-                stream_id = f"stream_{provider_id}"
-                index = 0
-                assistant_text = ""
-
-                await self.agent.query(query_content)
-                async for msg in self.agent.receive_response():
-                    _log_stream_event(msg, "agent")
-
-                    tool_name = extract_tool_use_start(msg)
-                    if tool_name:
-                        await self.gateway.send_to(provider_id, {
-                            "type": MessageType.PROGRESS,
-                            "tool": tool_name,
-                        })
-                        continue
-
-                    text = extract_stream_text(msg)
-                    if text:
-                        assistant_text += text
-                        await self.gateway.send_to(provider_id, {
-                            "type": MessageType.ASSISTANT_MESSAGE,
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": text,
-                            "is_final": False,
-                        })
-                        index += 1
-
-                    elif isinstance(msg, ResultMessage):
-                        await self.gateway.send_to(provider_id, {
-                            "type": MessageType.ASSISTANT_MESSAGE,
-                            "stream_id": stream_id,
-                            "index": index,
-                            "content": "",
-                            "is_final": True,
-                        })
-
-                if assistant_text.strip():
-                    log_message(self.session_id, "assistant", assistant_text.strip())
-
+                await self._stream_agent_response(
+                    self.agent, query_content, provider_id, "agent",
+                )
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -482,6 +457,146 @@ class DaemonServer:
                 "content": str(e),
                 "is_final": True,
             })
+
+    async def _handle_group_message(
+        self,
+        content: str,
+        provider_id: str,
+        sender: str,
+        is_owner: bool,  # noqa: ARG002 — reserved for Phase 2 per-group agents
+        *,
+        channel_id: str | None = None,
+        context: list[dict] | None = None,
+    ):
+        """Handle a group chat message — routes to a temporary sub-agent.
+
+        In Phase 2 this will use per-channel persistent agents.
+        """
+        channel_label = channel_id or "unknown"
+        logger.debug("[group/%s] %s: %s", channel_label, sender, _truncate(content))
+
+        # Build the query with conversation context
+        query_parts = []
+        if context:
+            query_parts.append("[群聊上下文]")
+            for msg in context:
+                query_parts.append(f"{msg.get('sender', '?')}: {msg.get('content', '')}")
+            query_parts.append("")  # blank line separator
+
+        query_parts.append(f"[{sender}]: {content}")
+        query_text = "\n".join(query_parts)
+
+        try:
+            # Create a temporary sub-agent for this group interaction
+            persona_path = get_persona_path()
+            user_path = get_user_path()
+            system_prompt = build_system_prompt(persona_path, user_path)
+
+            tools_server, allowed_tools = _create_tools_server(include_schedule=False)
+            options = ClaudeAgentOptions(
+                system_prompt=(
+                    f"{system_prompt}\n\n"
+                    "You are responding to a group chat message. "
+                    "If the conversation does not need your response, "
+                    "reply with exactly: NO_RESPONSE"
+                ),
+                mcp_servers={"vtuber-tools": tools_server},
+                allowed_tools=allowed_tools,
+                permission_mode="bypassPermissions",
+                cli_path=get_config().cli_path,
+                cwd=str(ensure_workspace_dir()),
+            )
+            subagent = ClaudeSDKClient(options)
+            await subagent.connect()
+
+            try:
+                await self._stream_agent_response(
+                    subagent, query_text, provider_id, f"group/{channel_label}",
+                    no_response_token="NO_RESPONSE",
+                )
+            finally:
+                await subagent.disconnect()
+
+        except Exception as e:
+            logger.error("[group/%s] error: %s", channel_label, e, exc_info=True)
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": str(e),
+                "is_final": True,
+            })
+
+    async def _stream_agent_response(
+        self,
+        agent: ClaudeSDKClient,
+        query: str,
+        provider_id: str,
+        log_source: str,
+        *,
+        no_response_token: str | None = None,
+    ):
+        """Send a query to an agent and stream the response to a provider.
+
+        Args:
+            agent: The SDK client to query.
+            query: The query string.
+            provider_id: Where to send the streamed response.
+            log_source: Label for log messages.
+            no_response_token: If set and the full response matches this token,
+                               send an empty final message instead (agent chose not to respond).
+        """
+        stream_id = f"stream_{provider_id}"
+        index = 0
+        assistant_text = ""
+
+        await agent.query(query)
+        async for msg in agent.receive_response():
+            _log_stream_event(msg, log_source)
+
+            tool_name = extract_tool_use_start(msg)
+            if tool_name:
+                await self.gateway.send_to(provider_id, {
+                    "type": MessageType.PROGRESS,
+                    "tool": tool_name,
+                })
+                continue
+
+            text = extract_stream_text(msg)
+            if text:
+                assistant_text += text
+                await self.gateway.send_to(provider_id, {
+                    "type": MessageType.ASSISTANT_MESSAGE,
+                    "stream_id": stream_id,
+                    "index": index,
+                    "content": text,
+                    "is_final": False,
+                })
+                index += 1
+
+            elif isinstance(msg, ResultMessage):
+                # Check for no-response token
+                if no_response_token and no_response_token in assistant_text.strip().upper():
+                    logger.debug("[%s] agent chose not to respond", log_source)
+                    # Send empty final so provider knows the interaction is done
+                    await self.gateway.send_to(provider_id, {
+                        "type": MessageType.ASSISTANT_MESSAGE,
+                        "stream_id": stream_id,
+                        "index": index,
+                        "content": "",
+                        "is_final": True,
+                        "no_response": True,
+                    })
+                else:
+                    await self.gateway.send_to(provider_id, {
+                        "type": MessageType.ASSISTANT_MESSAGE,
+                        "stream_id": stream_id,
+                        "index": index,
+                        "content": "",
+                        "is_final": True,
+                    })
+
+        if assistant_text.strip():
+            if not (no_response_token and no_response_token in assistant_text.strip().upper()):
+                log_message(self.session_id, "assistant", assistant_text.strip())
 
     async def _heartbeat_loop(self):
         """Periodic heartbeat loop."""

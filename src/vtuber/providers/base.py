@@ -4,12 +4,21 @@ import asyncio
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from vtuber.daemon.protocol import encode_message, decode_message, MessageType
 from vtuber.config import get_socket_path
 
 logger = logging.getLogger("vtuber.provider")
+
+
+@dataclass
+class ChatMessage:
+    """A single message in a conversation context."""
+
+    sender: str
+    content: str
 
 
 class Provider(ABC):
@@ -69,19 +78,40 @@ class Provider(ABC):
             except Exception:
                 pass
 
-    async def send_message(self, content: str, sender: str = "owner") -> None:
+    async def send_message(
+        self,
+        content: str,
+        *,
+        sender: str = "owner",
+        is_owner: bool = True,
+        is_private: bool = True,
+        channel_id: str | None = None,
+        context: list[ChatMessage] | None = None,
+    ) -> None:
         """Send a user message to the daemon.
 
         Args:
             content: The message text.
-            sender: Who sent this message. "owner" = the agent's primary user.
-                    In group chats, this could be another participant's name.
+            sender: Display name of the message sender.
+            is_owner: Whether the sender is the agent's primary user.
+            is_private: True for DM/CLI, False for group chats.
+            channel_id: Unique channel identifier for group chats.
+            context: Recent conversation context (for group chats).
         """
-        await self._send({
+        msg: dict = {
             "type": MessageType.USER_MESSAGE,
             "content": content,
             "sender": sender,
-        })
+            "is_owner": is_owner,
+            "is_private": is_private,
+        }
+        if channel_id is not None:
+            msg["channel_id"] = channel_id
+        if context:
+            msg["context"] = [
+                {"sender": m.sender, "content": m.content} for m in context
+            ]
+        await self._send(msg)
 
     async def _send(self, msg: dict) -> None:
         """Send a raw message dict to daemon."""

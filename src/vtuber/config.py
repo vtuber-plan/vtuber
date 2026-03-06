@@ -2,11 +2,22 @@
 
 from pathlib import Path
 
+from typing import Any
+
 import yaml
 from pydantic import BaseModel, Field
 
 
 # ── User configuration model ────────────────────────────────────────
+
+
+class ProviderConfig(BaseModel):
+    """Per-provider configuration."""
+
+    owner_id: str = Field(
+        default="",
+        description="Platform-specific user ID of the agent's owner",
+    )
 
 
 class VTuberConfig(BaseModel):
@@ -35,6 +46,15 @@ class VTuberConfig(BaseModel):
         ge=10,
         description="CLI response timeout in seconds",
     )
+    providers: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Per-provider settings (e.g., discord.owner_id)",
+    )
+
+    def get_provider_config(self, provider_type: str) -> ProviderConfig:
+        """Get config for a specific provider type."""
+        raw = self.providers.get(provider_type, {})
+        return ProviderConfig(**raw)
 
 
 _config: VTuberConfig | None = None

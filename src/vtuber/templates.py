@@ -64,4 +64,11 @@ log_level: INFO
 
 # CLI 响应超时（秒）
 response_timeout: 300
+
+# Provider 配置（按平台名分区，配置 owner_id 以识别主人）
+# providers:
+#   discord:
+#     owner_id: "123456789012345678"
+#   telegram:
+#     owner_id: "112233"
 """
