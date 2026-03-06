@@ -59,7 +59,8 @@ def setup_logging():
     )
 
     root = logging.getLogger("vtuber")
-    root.setLevel(getattr(logging, get_config().log_level, logging.INFO))
+    level = getattr(logging, get_config().log_level, logging.INFO)
+    root.setLevel(level)
     root.addHandler(handler)
 
     # Also log to stderr when running in foreground
@@ -68,7 +69,7 @@ def setup_logging():
         console_handler.setFormatter(
             logging.Formatter("[%(levelname)s] %(message)s")
         )
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(level)
         root.addHandler(console_handler)
 
 
@@ -88,13 +89,13 @@ def _log_stream_event(msg, source: str = "agent"):
             block = event.get("content_block", {})
             if block.get("type") == "tool_use":
                 tool_name = block.get("name", "?")
-                logger.info("[%s] tool_call: %s", source, tool_name)
+                logger.debug("[%s] tool_call: %s", source, tool_name)
 
     elif isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, ToolUseBlock):
                 input_preview = _truncate(json.dumps(block.input, ensure_ascii=False))
-                logger.info("[%s] tool_call: %s(%s)", source, block.name, input_preview)
+                logger.debug("[%s] tool_call: %s(%s)", source, block.name, input_preview)
             elif isinstance(block, TextBlock) and block.text:
                 logger.debug("[%s] text: %s", source, _truncate(block.text))
 
@@ -305,7 +306,12 @@ class DaemonServer:
 
         # Create agent with all Claude Code tools + custom vtuber tools
         options = ClaudeAgentOptions(
-            system_prompt=system_prompt,
+            # system_prompt=system_prompt,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",  # Use Claude Code's system prompt
+                "append": system_prompt,
+            },
             tools={"type": "preset", "preset": "claude_code"},
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
@@ -421,7 +427,7 @@ class DaemonServer:
 
         # Log user message to session
         log_message(self.session_id, "user", content)
-        logger.info("[user] %s", _truncate(content))
+        logger.debug("[user] %s", _truncate(content))
 
         try:
             async with self._agent_lock:
