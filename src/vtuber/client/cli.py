@@ -1,23 +1,42 @@
 """CLI client for connecting to the VTuber daemon with rich UI."""
 
 import asyncio
+import os
 import sys
+from io import StringIO
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+
 from vtuber.daemon.protocol import encode_message, decode_message
 from vtuber.config import get_socket_path, ensure_config_dir
 
 console = Console()
 
+SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+CHAT_STYLE = Style.from_dict({
+    "bottom-toolbar": "bg:#1a1a2e",
+    "spinner": "#00aaff bold",
+    "spinner-text": "#aaaaaa",
+    "toolbar-sep": "#444444",
+    "toolbar-hint": "#666666",
+})
+
 
 class CLIClient:
-    """Command-line client for interacting with the VTuber daemon."""
+    """Command-line client for interacting with the VTuber daemon.
+
+    Uses patch_stdout to keep the input prompt fixed at the bottom of the
+    terminal (like Discord) while messages scroll above it.
+    """
 
     def __init__(self, socket_path: Path | None = None):
         self.socket_path = socket_path or get_socket_path()
@@ -26,10 +45,47 @@ class CLIClient:
         self.running = False
         self._stream_buffer = ""
         self._is_streaming = False
+        self._spinner_frame = 0
+        self._spinner_task: asyncio.Task | None = None
 
         # Setup prompt with history
         history_path = ensure_config_dir() / "cli_history"
         self.session = PromptSession(history=FileHistory(str(history_path)))
+
+    # ── Toolbar & Rendering ──────────────────────────────────────────
+
+    def _get_toolbar(self):
+        """Bottom toolbar: spinner during streaming, hints otherwise."""
+        if self._is_streaming:
+            frame = SPINNER_CHARS[self._spinner_frame % len(SPINNER_CHARS)]
+            return [
+                ("class:spinner", f" {frame} "),
+                ("class:spinner-text", "思考中... "),
+                ("class:toolbar-sep", "│ "),
+                ("class:toolbar-hint", "/quit 退出 "),
+            ]
+        return [("class:toolbar-hint", " /quit 退出 ")]
+
+    def _render_panel(self, label: str, text: str, style: str = "cyan") -> str:
+        """Render a rich Panel + Markdown to an ANSI string."""
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 80
+        sio = StringIO()
+        c = Console(file=sio, force_terminal=True, width=width)
+        c.print()
+        c.print(
+            Panel(
+                Markdown(text),
+                title=f"[bold {style}]{label}[/bold {style}]",
+                border_style=style,
+                padding=(1, 2),
+            )
+        )
+        return sio.getvalue()
+
+    # ── Connection ───────────────────────────────────────────────────
 
     async def connect(self):
         """Connect to the daemon server."""
@@ -49,10 +105,11 @@ class CLIClient:
                 str(self.socket_path)
             )
             self.running = True
+            console.print()
             console.print(
                 Panel(
                     "[green]已连接到 VTuber daemon[/green]\n"
-                    "输入消息并回车发送，输入 [bold]/quit[/bold] 或 [bold]/exit[/bold] 退出",
+                    "输入消息并回车发送，输入 [bold]/quit[/bold] 退出",
                     title="VTuber Chat",
                     border_style="green",
                 )
@@ -74,17 +131,18 @@ class CLIClient:
                 pass
         console.print("\n[dim]已断开连接[/dim]")
 
+    # ── Messaging ────────────────────────────────────────────────────
+
     async def send_message(self, content: str):
         """Send a user message to the daemon."""
         if not self.writer:
             return
-
         try:
             msg = encode_message({"type": "user_message", "content": content})
             self.writer.write(msg.encode("utf-8"))
             await self.writer.drain()
         except Exception as e:
-            console.print(f"[red]发送失败：{e}[/red]")
+            print(f"\033[31m发送失败：{e}\033[0m", flush=True)
 
     async def receive_messages(self):
         """Receive and display messages from the daemon."""
@@ -96,7 +154,7 @@ class CLIClient:
             while self.running:
                 data = await self.reader.read(4096)
                 if not data:
-                    console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
+                    print("\n\033[33mDaemon 连接已关闭\033[0m", flush=True)
                     self.running = False
                     break
 
@@ -110,10 +168,14 @@ class CLIClient:
             pass
         except Exception as e:
             if self.running:
-                console.print(f"\n[red]接收消息错误：{e}[/red]")
+                print(f"\n\033[31m接收消息错误：{e}\033[0m", flush=True)
 
     async def _handle_message(self, line: str):
-        """Handle a message from the daemon."""
+        """Handle a message from the daemon.
+
+        Uses print() instead of console.print() so that output goes through
+        the patch_stdout proxy and appears above the fixed input prompt.
+        """
         try:
             msg = decode_message(line)
             msg_type = msg.get("type")
@@ -124,70 +186,103 @@ class CLIClient:
 
                 if content:
                     self._stream_buffer += content
-                    # Show streaming indicator
                     if not self._is_streaming:
                         self._is_streaming = True
 
                 if is_final:
-                    # Render complete response as markdown
+                    # Stop spinner first
+                    self._is_streaming = False
+                    if self._spinner_task:
+                        self._spinner_task.cancel()
+                        self._spinner_task = None
+
+                    # Render complete response as markdown panel
                     if self._stream_buffer.strip():
                         label = "AI" if msg_type == "assistant_message" else "Task"
-                        console.print()
-                        console.print(
-                            Panel(
-                                Markdown(self._stream_buffer.strip()),
-                                title=f"[bold cyan]{label}[/bold cyan]",
-                                border_style="cyan",
-                                padding=(1, 2),
-                            )
-                        )
-                        console.print()
+                        output = self._render_panel(label, self._stream_buffer.strip())
+                        print(output, flush=True)
+
                     self._stream_buffer = ""
-                    self._is_streaming = False
+
+                    # Refresh toolbar to remove spinner
+                    if self.session.app:
+                        self.session.app.invalidate()
 
             elif msg_type == "error":
                 error = msg.get("content", "Unknown error")
-                console.print(f"\n[red bold]错误：[/red bold] {error}")
+                print(f"\n\033[1;31m错误：\033[0m {error}", flush=True)
 
             elif msg_type == "pong":
                 pass
 
         except Exception as e:
-            console.print(f"\n[red]处理消息错误：{e}[/red]")
+            print(f"\n\033[31m处理消息错误：{e}\033[0m", flush=True)
+
+    # ── Spinner ──────────────────────────────────────────────────────
+
+    async def _animate_spinner(self):
+        """Animate the spinner in the bottom toolbar."""
+        try:
+            while True:
+                self._spinner_frame += 1
+                if self.session.app:
+                    self.session.app.invalidate()
+                await asyncio.sleep(0.08)
+        except asyncio.CancelledError:
+            pass
+
+    # ── Main Loop ────────────────────────────────────────────────────
 
     async def run(self):
-        """Run the interactive CLI client."""
+        """Run the interactive CLI client.
+
+        Uses patch_stdout to keep the input prompt fixed at the bottom of the
+        terminal. All output (AI responses, errors) appears above the prompt,
+        giving a Discord-like chat experience.
+        """
         if not await self.connect():
             return
 
         receive_task = asyncio.create_task(self.receive_messages())
 
         try:
-            while self.running:
-                try:
-                    loop = asyncio.get_event_loop()
-                    user_input = await loop.run_in_executor(
-                        None,
-                        lambda: self.session.prompt(
-                            HTML("<ansigreen><b>You</b></ansigreen> <ansigray>›</ansigray> ")
-                        ),
-                    )
+            with patch_stdout():
+                while self.running:
+                    try:
+                        user_input = await self.session.prompt_async(
+                            HTML(
+                                "<ansigreen><b> You </b></ansigreen>"
+                                "<ansigray> › </ansigray>"
+                            ),
+                            bottom_toolbar=self._get_toolbar,
+                            style=CHAT_STYLE,
+                        )
 
-                    if user_input.strip().lower() in ["/quit", "/exit"]:
+                        if user_input.strip().lower() in ("/quit", "/exit"):
+                            break
+
+                        if user_input.strip():
+                            # Show user message as a panel above the prompt
+                            user_panel = self._render_panel(
+                                "You", user_input.strip(), style="green"
+                            )
+                            print(user_panel, flush=True)
+
+                            # Start spinner and send message
+                            self._is_streaming = True
+                            self._spinner_task = asyncio.create_task(
+                                self._animate_spinner()
+                            )
+                            await self.send_message(user_input)
+
+                    except EOFError:
                         break
-
-                    if user_input.strip():
-                        await self.send_message(user_input)
-                        # Show thinking spinner
-                        console.print("[dim]思考中...[/dim]", end="\r")
-
-                except EOFError:
-                    break
-                except KeyboardInterrupt:
-                    console.print()
-                    continue
+                    except KeyboardInterrupt:
+                        continue
 
         finally:
+            if self._spinner_task:
+                self._spinner_task.cancel()
             receive_task.cancel()
             try:
                 await receive_task
