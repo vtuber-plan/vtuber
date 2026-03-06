@@ -2,16 +2,22 @@
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk.types import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    StreamEvent,
+    TextBlock,
+    ToolUseBlock,
 )
 
 from vtuber.daemon.protocol import decode_message, encode_message
@@ -25,10 +31,78 @@ from vtuber.config import (
     get_persona_path,
     get_user_path,
     get_heartbeat_path,
+    get_log_path,
 )
 from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.memory import log_message, create_session_id
 from vtuber.utils import extract_stream_text
+
+logger = logging.getLogger("vtuber.daemon")
+
+CLI_PATH = "claude"
+
+
+def setup_logging():
+    """Configure logging to ~/.vtuber/daemon.log with rotation."""
+    ensure_config_dir()
+    log_path = get_log_path()
+
+    handler = RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+
+    root = logging.getLogger("vtuber")
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+
+    # Also log to stderr when running in foreground
+    if sys.stderr and sys.stderr.isatty():
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(
+            logging.Formatter("[%(levelname)s] %(message)s")
+        )
+        console_handler.setLevel(logging.INFO)
+        root.addHandler(console_handler)
+
+
+def _truncate(s: str, max_len: int = 200) -> str:
+    """Truncate a string for log display."""
+    s = s.replace("\n", " ").strip()
+    return s[:max_len] + "..." if len(s) > max_len else s
+
+
+def _log_stream_event(msg, source: str = "agent"):
+    """Log interesting stream events (tool calls, results, errors)."""
+    if isinstance(msg, StreamEvent):
+        event = msg.event
+        etype = event.get("type")
+
+        if etype == "content_block_start":
+            block = event.get("content_block", {})
+            if block.get("type") == "tool_use":
+                tool_name = block.get("name", "?")
+                logger.info("[%s] tool_call: %s", source, tool_name)
+
+    elif isinstance(msg, AssistantMessage):
+        for block in msg.content:
+            if isinstance(block, ToolUseBlock):
+                input_preview = _truncate(json.dumps(block.input, ensure_ascii=False))
+                logger.info("[%s] tool_call: %s(%s)", source, block.name, input_preview)
+            elif isinstance(block, TextBlock) and block.text:
+                logger.debug("[%s] text: %s", source, _truncate(block.text))
+
+    elif isinstance(msg, ResultMessage):
+        cost = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"
+        logger.info(
+            "[%s] result: turns=%d, cost=%s, duration=%dms",
+            source, msg.num_turns, cost, msg.duration_ms,
+        )
 
 
 def _create_tools_server(include_schedule: bool = True):
@@ -91,11 +165,11 @@ class DaemonServer:
 
         # Start queue consumer for scheduled tasks
         self._task_consumer = asyncio.create_task(self._process_scheduled_tasks())
-        print("Scheduler started")
+        logger.info("Scheduler started (db=%s)", db_path)
 
         # Initialize agent
         await self._initialize_agent()
-        print("Agent initialized")
+        logger.info("Agent initialized")
 
         # Start Unix socket server
         self._server = await asyncio.start_unix_server(
@@ -106,13 +180,14 @@ class DaemonServer:
 
         # Start heartbeat timer after is_running is set so the loop condition works
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        print(f"Heartbeat started (every {self.heartbeat_interval} minutes)")
+        logger.info("Heartbeat started (every %d min)", self.heartbeat_interval)
 
         # Write PID file
         pid_path = get_pid_path()
         pid_path.write_text(str(os.getpid()))
 
-        print(f"Daemon started on {self.socket_path}")
+        logger.info("Daemon started on %s (pid=%d, session=%s)",
+                     self.socket_path, os.getpid(), self.session_id)
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -127,7 +202,7 @@ class DaemonServer:
                 try:
                     await self._execute_scheduled_task(task_prompt)
                 except Exception as e:
-                    print(f"Error executing scheduled task: {e}")
+                    logger.error("Scheduled task error: %s", e, exc_info=True)
                 finally:
                     self._task_queue.task_done()
         except asyncio.CancelledError:
@@ -135,7 +210,7 @@ class DaemonServer:
 
     async def _execute_scheduled_task(self, task_prompt: str):
         """Execute a scheduled task using a temporary subagent."""
-        print(f"Executing scheduled task: {task_prompt}")
+        logger.info("[schedule] executing: %s", _truncate(task_prompt))
 
         # Create a temporary subagent with independent context
         try:
@@ -150,7 +225,7 @@ class DaemonServer:
                 mcp_servers={"vtuber-tools": tools_server},
                 allowed_tools=allowed_tools,
                 permission_mode="bypassPermissions",
-                cli_path="ripperdoc",
+                cli_path=CLI_PATH,
             )
             subagent = ClaudeSDKClient(options)
             await subagent.connect()
@@ -161,6 +236,7 @@ class DaemonServer:
 
             await subagent.query(f"[Scheduled Task] {task_prompt}")
             async for msg in subagent.receive_response():
+                _log_stream_event(msg, "schedule")
                 text = extract_stream_text(msg)
                 if text:
                     # Stream result to all clients
@@ -192,10 +268,10 @@ class DaemonServer:
                     await self._broadcast(response)
 
             await subagent.disconnect()
-            print(f"Task completed: {task_prompt}")
+            logger.info("[schedule] completed: %s", _truncate(task_prompt))
 
         except Exception as e:
-            print(f"Error executing scheduled task: {e}")
+            logger.error("[schedule] failed: %s — %s", _truncate(task_prompt), e, exc_info=True)
             # Notify clients of error
             error_msg = encode_message(
                 {
@@ -220,7 +296,7 @@ class DaemonServer:
             mcp_servers={"vtuber-tools": tools_server},
             allowed_tools=allowed_tools,
             permission_mode="bypassPermissions",
-            cli_path="ripperdoc",
+            cli_path=CLI_PATH,
         )
         self.agent = ClaudeSDKClient(options)
         await self.agent.connect()
@@ -230,7 +306,7 @@ class DaemonServer:
     ):
         """Handle a new client connection."""
         addr = writer.get_extra_info("peername") or "client"
-        print(f"New client connected: {addr}")
+        logger.info("Client connected: %s (total=%d)", addr, len(self.clients) + 1)
         self.clients.append(writer)
 
         try:
@@ -253,7 +329,7 @@ class DaemonServer:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    print(f"Error reading from client: {e}")
+                    logger.error("Error reading from client: %s", e)
                     break
         finally:
             # Remove client from list
@@ -264,7 +340,7 @@ class DaemonServer:
                 await writer.wait_closed()
             except Exception:
                 pass
-            print(f"Client disconnected: {addr}")
+            logger.info("Client disconnected: %s (remaining=%d)", addr, len(self.clients))
 
     async def _process_message(
         self, line: str, writer: asyncio.StreamWriter
@@ -286,12 +362,12 @@ class DaemonServer:
                 await writer.drain()
 
             else:
-                print(f"Unknown message type: {msg_type}")
+                logger.warning("Unknown message type: %s", msg_type)
 
         except json.JSONDecodeError as e:
-            print(f"Invalid JSON message: {e}")
+            logger.error("Invalid JSON message: %s", e)
         except Exception as e:
-            print(f"Error processing message: {e}")
+            logger.error("Error processing message: %s", e, exc_info=True)
 
     async def _handle_user_message(self, content: str, writer: asyncio.StreamWriter):
         """Handle a user message by sending it to the agent and streaming the response."""
@@ -309,6 +385,7 @@ class DaemonServer:
 
         # Log user message to session
         log_message(self.session_id, "user", content)
+        logger.info("[user] %s", _truncate(content))
 
         try:
             # Send message to agent (acquire lock to prevent concurrent agent access)
@@ -319,6 +396,7 @@ class DaemonServer:
 
                 await self.agent.query(content)
                 async for msg in self.agent.receive_response():
+                    _log_stream_event(msg, "agent")
                     text = extract_stream_text(msg)
                     if text:
                         assistant_text += text
@@ -353,7 +431,7 @@ class DaemonServer:
                     log_message(self.session_id, "assistant", assistant_text.strip())
 
         except Exception as e:
-            print(f"Error handling message: {e}")
+            logger.error("[agent] error handling message: %s", e, exc_info=True)
             error_msg = encode_message(
                 {
                     "type": "error",
@@ -380,7 +458,7 @@ class DaemonServer:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Heartbeat error: {e}")
+                logger.error("Heartbeat error: %s", e, exc_info=True)
 
     async def _send_heartbeat(self):
         """Send a heartbeat message to the agent."""
@@ -409,12 +487,14 @@ class DaemonServer:
             heartbeat_msg += "- Or simply respond with 'HEARTBEAT_OK' if everything is fine."
 
             # Send heartbeat to agent (acquire lock to prevent concurrent agent access)
+            logger.info("[heartbeat] sending heartbeat to agent")
             async with self._agent_lock:
                 stream_id = f"heartbeat_{asyncio.get_running_loop().time()}"
                 collected_text = ""
 
                 await self.agent.query(heartbeat_msg)
                 async for msg in self.agent.receive_response():
+                    _log_stream_event(msg, "heartbeat")
                     text = extract_stream_text(msg)
                     if text:
                         collected_text += text
@@ -424,6 +504,7 @@ class DaemonServer:
 
             # After collecting all text, decide whether to broadcast
             if collected_text.strip() and "HEARTBEAT_OK" not in collected_text.upper():
+                logger.info("[heartbeat] agent responded: %s", _truncate(collected_text))
                 response = encode_message(
                     {
                         "type": "heartbeat_message",
@@ -444,11 +525,13 @@ class DaemonServer:
                     }
                 )
                 await self._broadcast(final_response)
+            else:
+                logger.info("[heartbeat] agent replied HEARTBEAT_OK")
 
-            print("Heartbeat completed")
+            logger.info("[heartbeat] completed")
 
         except Exception as e:
-            print(f"Error sending heartbeat: {e}")
+            logger.error("[heartbeat] error: %s", e, exc_info=True)
 
     async def _broadcast(self, message: str):
         """Broadcast a message to all connected clients."""
@@ -462,7 +545,7 @@ class DaemonServer:
                 writer.write(message.encode("utf-8"))
                 await writer.drain()
             except Exception as e:
-                print(f"Error broadcasting to client: {e}")
+                logger.error("Error broadcasting to client: %s", e)
                 disconnected.append(writer)
 
         # Remove disconnected clients
@@ -474,7 +557,7 @@ class DaemonServer:
         """Shutdown the daemon server gracefully."""
         if not self.is_running:
             return  # Already shutting down
-        print("Shutting down daemon...")
+        logger.info("Shutting down daemon...")
         self.is_running = False
 
         # Stop heartbeat task
@@ -529,7 +612,7 @@ class DaemonServer:
         if pid_path.exists():
             pid_path.unlink()
 
-        print("Daemon shutdown complete")
+        logger.info("Daemon shutdown complete")
 
     async def run_forever(self):
         """Run the server until shutdown."""
@@ -580,15 +663,19 @@ def start_daemon_background():
 
     # Start daemon in background using subprocess
     try:
-        # Use subprocess to start daemon in background
+        ensure_config_dir()
+        log_path = get_log_path()
+        log_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+
         subprocess.Popen(
             [sys.executable, "-m", "vtuber.daemon.server"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
             stdin=subprocess.DEVNULL,
             start_new_session=True,  # Detach from terminal
         )
         print("Daemon started in background")
+        print(f"Log: {log_path}")
 
         # Wait a moment and verify it started
         import time
@@ -695,14 +782,15 @@ def check_status():
 
 def main():
     """Main entry point for daemon server."""
+    setup_logging()
     try:
         server = DaemonServer()
         asyncio.run(server.run_forever())
     except KeyboardInterrupt:
-        print("\nDaemon stopped by user")
+        logger.info("Daemon stopped by user")
         sys.exit(0)
     except Exception as e:
-        print(f"Daemon error: {e}")
+        logger.error("Daemon error: %s", e, exc_info=True)
         sys.exit(1)
 
 

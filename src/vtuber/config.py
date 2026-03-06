@@ -54,6 +54,11 @@ def get_long_term_memory_path() -> Path:
     return get_config_dir() / "long_term_memory.md"
 
 
+def get_log_path() -> Path:
+    """Get the daemon log file path."""
+    return get_config_dir() / "daemon.log"
+
+
 def ensure_sessions_dir() -> Path:
     """Ensure the sessions directory exists and return its path."""
     sessions_dir = get_sessions_dir()

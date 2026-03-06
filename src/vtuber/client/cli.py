@@ -144,7 +144,7 @@ class CLIClient:
             console.print(
                 Panel(
                     Markdown(hb.strip()),
-                    title="[bold cyan]AI[/bold cyan]",
+                    title="[bold cyan]Agent[/bold cyan]",
                     border_style="cyan",
                     padding=(1, 2),
                 )
@@ -160,11 +160,11 @@ class CLIClient:
                     is_final = msg.get("is_final", False)
                     if content and is_final:
                         labels = {
-                            "assistant_message": "AI",
+                            "assistant_message": "Agent",
                             "task_message": "Task",
-                            "heartbeat_message": "AI",
+                            "heartbeat_message": "Agent",
                         }
-                        label = labels.get(msg_type, "AI")
+                        label = labels.get(msg_type, "Agent")
                         console.print(
                             Panel(
                                 Markdown(content.strip()),
@@ -183,7 +183,7 @@ class CLIClient:
     async def _wait_for_response(self):
         """Show spinner while collecting streamed response, then render panel."""
         collected = ""
-        label = "AI"
+        label = "Agent"
 
         spinner = Spinner("dots", text=Text(" 思考中...", style="dim"))
 
