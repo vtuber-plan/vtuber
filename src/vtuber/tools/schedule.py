@@ -1,14 +1,14 @@
 """Schedule tools using APScheduler for precise task execution."""
 
+import asyncio
 from typing import Any
-from datetime import datetime
-from pathlib import Path
 
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
-# Note: Actual scheduler instance will be injected by daemon
+# Injected by daemon on startup
 _scheduler = None
+_task_queue: asyncio.Queue | None = None
 
 
 def set_scheduler(scheduler):
@@ -17,9 +17,26 @@ def set_scheduler(scheduler):
     _scheduler = scheduler
 
 
+def set_task_queue(queue: asyncio.Queue):
+    """Set the task queue for communicating scheduled tasks to the daemon."""
+    global _task_queue
+    _task_queue = queue
+
+
+async def scheduled_job_handler(task: str = ""):
+    """Async handler called by APScheduler when a scheduled job fires.
+
+    This is a named, importable function (not a lambda) so that APScheduler
+    can serialize it to the SQLAlchemy job store. It puts the task prompt
+    into an asyncio.Queue that the daemon consumes.
+    """
+    if _task_queue and task:
+        await _task_queue.put(task)
+
+
 @tool(
     "schedule_create",
-    "Create a scheduled task for the agent to execute at a specific time or interval",
+    "Create a scheduled task for the agent to execute at a specific time or interval.",
     {
         "type": "object",
         "properties": {
@@ -34,14 +51,25 @@ def set_scheduler(scheduler):
             "trigger_type": {
                 "type": "string",
                 "enum": ["date", "interval", "cron"],
-                "description": "Type of trigger: 'date' (one-time), 'interval' (recurring), 'cron' (cron expression)",
+                "description": (
+                    "Type of trigger: "
+                    "'date' (one-time at specific datetime), "
+                    "'interval' (recurring every N hours/minutes), "
+                    "'cron' (cron-style recurring)"
+                ),
             },
             "trigger_config": {
                 "type": "object",
-                "description": "Trigger configuration (e.g., {'run_date': '2026-03-05 18:00:00'} or {'hours': 1})",
+                "description": (
+                    "Trigger parameters passed to APScheduler. Examples:\n"
+                    "- date: {\"run_date\": \"2026-07-22 09:00:00\"}\n"
+                    "- interval: {\"hours\": 1} or {\"minutes\": 30}\n"
+                    "- cron: {\"month\": 7, \"day\": 22, \"hour\": 9} for yearly July 22 at 9am\n"
+                    "- cron: {\"hour\": 8, \"minute\": 0} for daily at 8am"
+                ),
             },
         },
-        "required": ["task_id", "task", "trigger_type"],
+        "required": ["task_id", "task", "trigger_type", "trigger_config"],
     },
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
@@ -56,23 +84,32 @@ async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
 
     task_id = args["task_id"]
     task_prompt = args["task"]
-    trigger_type = args.get("trigger_type", "date")
+    trigger_type = args["trigger_type"]
     trigger_config = args.get("trigger_config", {})
 
-    # Add job to scheduler
     try:
         _scheduler.scheduler.add_job(
-            func=lambda: None,  # Placeholder, daemon will intercept
+            func=scheduled_job_handler,
             trigger=trigger_type,
             id=task_id,
             kwargs={"task": task_prompt},
+            replace_existing=True,
             **trigger_config,
         )
+
+        # Read back the job to confirm next run time
+        job = _scheduler.scheduler.get_job(task_id)
+        next_run = (
+            job.next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+            if job and job.next_run_time
+            else "pending"
+        )
+
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": f"Created scheduled task '{task_id}': {task_prompt}",
+                    "text": f"Created scheduled task '{task_id}': {task_prompt} (next run: {next_run})",
                 }
             ]
         }
@@ -108,7 +145,8 @@ async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
     lines = ["Scheduled tasks:"]
     for job in jobs:
         next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "N/A"
-        lines.append(f"- {job.id}: {job.kwargs.get('task', 'N/A')} (next: {next_run})")
+        task_desc = job.kwargs.get("task", "N/A") if job.kwargs else "N/A"
+        lines.append(f"- {job.id}: {task_desc} (next: {next_run})")
 
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 

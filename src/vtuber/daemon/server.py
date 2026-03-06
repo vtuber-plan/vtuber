@@ -25,7 +25,7 @@ from vtuber.config import (
     get_persona_path,
     get_user_path,
 )
-from vtuber.tools.schedule import set_scheduler
+from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.memory import log_message, create_session_id
 from vtuber.utils import extract_stream_text
 
@@ -59,6 +59,8 @@ class DaemonServer:
         self.conversation_history: list[dict[str, Any]] = []
         self._server: asyncio.Server | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._task_queue: asyncio.Queue = asyncio.Queue()
+        self._task_consumer: asyncio.Task | None = None
         self.heartbeat_interval: int = 5  # Minutes between heartbeats
         self.session_id: str = create_session_id()
 
@@ -79,11 +81,14 @@ class DaemonServer:
         # Initialize scheduler
         db_path = get_db_path()
         self.scheduler = TaskScheduler(db_path)
-        self.scheduler.start()
-        set_scheduler(self.scheduler)
 
-        # Setup task execution callback
-        self._setup_scheduler_callback()
+        # Wire up task queue before starting scheduler
+        set_task_queue(self._task_queue)
+        set_scheduler(self.scheduler)
+        self.scheduler.start()
+
+        # Start queue consumer for scheduled tasks
+        self._task_consumer = asyncio.create_task(self._process_scheduled_tasks())
         print("Scheduler started")
 
         # Start heartbeat timer
@@ -112,24 +117,19 @@ class DaemonServer:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-    def _setup_scheduler_callback(self):
-        """Setup callback for scheduled task execution."""
-        # Add a listener for job execution
-        self.scheduler.scheduler.add_listener(
-            self._on_scheduled_task, mask=0x0001  # EVENT_JOB_EXECUTED
-        )
-
-    def _on_scheduled_task(self, event):
-        """Handle scheduled task execution."""
-        if hasattr(event, "job_id"):
-            try:
-                job = self.scheduler.scheduler.get_job(event.job_id)
-                if job and job.kwargs:
-                    task_prompt = job.kwargs.get("task", "")
-                    if task_prompt:
-                        asyncio.create_task(self._execute_scheduled_task(task_prompt))
-            except Exception:
-                pass
+    async def _process_scheduled_tasks(self):
+        """Consume scheduled tasks from the queue and execute them."""
+        try:
+            while True:
+                task_prompt = await self._task_queue.get()
+                try:
+                    await self._execute_scheduled_task(task_prompt)
+                except Exception as e:
+                    print(f"Error executing scheduled task: {e}")
+                finally:
+                    self._task_queue.task_done()
+        except asyncio.CancelledError:
+            pass
 
     async def _execute_scheduled_task(self, task_prompt: str):
         """Execute a scheduled task using a temporary subagent."""
@@ -480,6 +480,14 @@ class DaemonServer:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop task queue consumer
+        if self._task_consumer:
+            self._task_consumer.cancel()
+            try:
+                await self._task_consumer
             except asyncio.CancelledError:
                 pass
 
