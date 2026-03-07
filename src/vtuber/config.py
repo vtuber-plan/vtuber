@@ -169,6 +169,18 @@ def get_consolidation_state_path() -> Path:
     return get_config_dir() / "consolidation_state.json"
 
 
+def get_skills_dir() -> Path:
+    """Get the skills directory path."""
+    return get_config_dir() / "skills"
+
+
+def ensure_skills_dir() -> Path:
+    """Ensure the skills directory exists and return its path."""
+    skills_dir = get_skills_dir()
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    return skills_dir
+
+
 def get_log_path() -> Path:
     """Get the daemon log file path."""
     return get_config_dir() / "daemon.log"
