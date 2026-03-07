@@ -9,6 +9,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from rich.logging import RichHandler
+
 from claude_agent_sdk import ClaudeSDKClient
 
 from vtuber.config import (
@@ -20,12 +22,12 @@ from vtuber.config import (
     get_pid_path,
     get_socket_path,
 )
-from vtuber.daemon.agents import GroupAgentManager, create_agent
+from vtuber.daemon.agents import GroupAgentManager, create_agent, safe_disconnect
 from vtuber.daemon.gateway import Gateway, ProviderConnection
 from vtuber.daemon.heartbeat import HeartbeatManager
 from vtuber.daemon.protocol import MessageType, decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.daemon.streaming import iter_response, truncate
+from vtuber.daemon.streaming import AgentTimeoutError, iter_response, kill_agent_process, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
 from vtuber.tools.memory import create_session_id, log_message
 from vtuber.tools.schedule import set_scheduler, set_task_queue
@@ -55,9 +57,10 @@ def setup_logging():
 
     # Also log to stderr when running in foreground
     if sys.stderr and sys.stderr.isatty():
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setFormatter(
-            logging.Formatter("[%(levelname)s] %(message)s")
+        console_handler = RichHandler(
+            rich_tracebacks=True,
+            show_path=False,
+            markup=True,
         )
         console_handler.setLevel(level)
         root.addHandler(console_handler)
@@ -78,7 +81,6 @@ class DaemonServer:
         self.group_agents = GroupAgentManager()
         self.session_id = create_session_id()
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
-        self._refresh_event = asyncio.Event()
 
         # Subsystems (initialized in start())
         self._heartbeat: HeartbeatManager | None = None
@@ -113,7 +115,6 @@ class DaemonServer:
         self.agent = await create_agent(
             include_schedule=True,
             include_preset_tools=True,
-            refresh_event=self._refresh_event,
         )
         logger.info("Agent initialized")
 
@@ -259,14 +260,21 @@ class DaemonServer:
         query_content = content if is_owner else f"[{sender}]: {content}"
 
         try:
+            logger.debug("Acquiring agent lock...")
             async with self._agent_lock:
+                logger.debug("Agent lock acquired, sending query")
                 await self._stream_agent_response(
                     self.agent, query_content, provider_id, "agent",
                 )
             if self._heartbeat:
                 self._heartbeat.on_message()
-            if self._refresh_event.is_set():
-                await self._do_refresh()
+        except AgentTimeoutError as e:
+            logger.error("[agent] timeout: %s — recovering agent", e)
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": "Agent 响应超时，正在恢复...",
+            })
+            await self._recover_agent()
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -306,6 +314,9 @@ class DaemonServer:
                     agent, query_text, provider_id, f"group/{channel_label}",
                     no_response_token="NO_RESPONSE",
                 )
+        except AgentTimeoutError as e:
+            logger.error("[group/%s] timeout: %s — recovering agent", channel_label, e)
+            await self.group_agents.recover(channel_label)
         except Exception as e:
             logger.error("[group/%s] error: %s", channel_label, e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -313,24 +324,19 @@ class DaemonServer:
                 "content": str(e),
             })
 
-    async def _do_refresh(self) -> None:
-        """Refresh the main agent with updated system prompt (preserving session)."""
-        self._refresh_event.clear()
-        logger.info("Refreshing agent (skill update)")
-
+    async def _recover_agent(self) -> None:
+        """Recover from a hung agent by killing its subprocess and creating a new one."""
+        logger.warning("Recovering agent — killing old subprocess")
         if self.agent:
-            try:
-                await self.agent.disconnect()
-            except Exception:
-                pass
+            kill_agent_process(self.agent)
+            await safe_disconnect(self.agent)
+            self.agent = None
 
         self.agent = await create_agent(
             include_schedule=True,
             include_preset_tools=True,
-            refresh_event=self._refresh_event,
-            resume=True,
         )
-        logger.info("Agent refreshed with updated system prompt")
+        logger.info("Agent recovered (new session)")
 
     async def _stream_agent_response(
         self,
@@ -341,43 +347,60 @@ class DaemonServer:
         *,
         no_response_token: str | None = None,
     ):
-        """Send a query to an agent and stream the response to a provider."""
+        """Send a query to an agent and stream the response to a provider.
+
+        Guarantees that a done=True message is always sent, even on error.
+        """
         stream_id = f"stream_{provider_id}"
         index = 0
         assistant_text = ""
+        done_sent = False
 
-        async for event in iter_response(agent, query, log_source=log_source):
-            if event.type == "tool":
+        try:
+            async for event in iter_response(agent, query, log_source=log_source):
+                if event.type == "tool":
+                    await self.gateway.send_to(provider_id, {
+                        "type": MessageType.PROGRESS,
+                        "tool": event.tool,
+                    })
+                elif event.type == "text":
+                    assistant_text += event.text
+                    await self.gateway.send_to(provider_id, {
+                        "type": MessageType.ASSISTANT_MESSAGE,
+                        "stream_id": stream_id,
+                        "index": index,
+                        "content": event.text,
+                        "done": False,
+                    })
+                    index += 1
+                elif event.type == "result":
+                    is_no_response = (
+                        no_response_token
+                        and no_response_token in assistant_text.strip().upper()
+                    )
+                    final_msg = {
+                        "type": MessageType.ASSISTANT_MESSAGE,
+                        "stream_id": stream_id,
+                        "index": index,
+                        "content": "",
+                        "done": True,
+                    }
+                    if is_no_response:
+                        logger.debug("[%s] agent chose not to respond", log_source)
+                        final_msg["no_response"] = True
+                    await self.gateway.send_to(provider_id, final_msg)
+                    done_sent = True
+        finally:
+            # Always send done=True so the client never hangs waiting for it.
+            if not done_sent:
+                logger.debug("[%s] sending fallback done signal", log_source)
                 await self.gateway.send_to(provider_id, {
-                    "type": MessageType.PROGRESS,
-                    "tool": event.tool,
-                })
-            elif event.type == "text":
-                assistant_text += event.text
-                await self.gateway.send_to(provider_id, {
-                    "type": MessageType.ASSISTANT_MESSAGE,
-                    "stream_id": stream_id,
-                    "index": index,
-                    "content": event.text,
-                    "done": False,
-                })
-                index += 1
-            elif event.type == "result":
-                is_no_response = (
-                    no_response_token
-                    and no_response_token in assistant_text.strip().upper()
-                )
-                final_msg = {
                     "type": MessageType.ASSISTANT_MESSAGE,
                     "stream_id": stream_id,
                     "index": index,
                     "content": "",
                     "done": True,
-                }
-                if is_no_response:
-                    logger.debug("[%s] agent chose not to respond", log_source)
-                    final_msg["no_response"] = True
-                await self.gateway.send_to(provider_id, final_msg)
+                })
 
         if assistant_text.strip():
             is_no_response = (

@@ -6,6 +6,7 @@ import sys
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -22,45 +23,72 @@ console = Console()
 class CLIProvider(QueuedProvider):
     """Terminal-based provider using prompt_toolkit + rich.
 
-    Linear flow: input -> spinner -> response panel -> next input.
+    Each agent response is collected fully, then rendered as a
+    Rich Markdown panel.
     """
 
     provider_type = "cli"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._pending_heartbeats: list[str] = []
+        self._prompting = False
+        self._task_buffer = ""
 
-        # Setup prompt with history
         history_path = ensure_config_dir() / "cli_history"
         self.session = PromptSession(history=FileHistory(str(history_path)))
 
-    # ── Provider callback overrides ───────────────────────────────
+    # ── Callback overrides for INPUT phase ────────────────────────
+
+    async def on_task(self, content: str, task: str, *, done: bool) -> None:
+        if self._prompting:
+            if content:
+                self._task_buffer += content
+            if done:
+                if self._task_buffer.strip():
+                    console.print()
+                    console.print(Panel(
+                        Markdown(self._task_buffer.strip()),
+                        title="[bold cyan]Task[/bold cyan]",
+                        border_style="cyan",
+                        padding=(1, 2),
+                    ))
+                self._task_buffer = ""
+        else:
+            await self._msg_queue.put({
+                "type": "task_message",
+                "content": content,
+                "task": task,
+                "done": done,
+            })
+
+    async def on_heartbeat(self, content: str) -> None:
+        if self._prompting:
+            if content.strip():
+                console.print()
+                console.print(Panel(
+                    Markdown(content.strip()),
+                    title="[bold cyan]Agent[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                ))
+        else:
+            await self._msg_queue.put({
+                "type": "heartbeat_message",
+                "content": content,
+            })
 
     async def on_disconnected(self) -> None:
         console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
 
-    # ── UI helpers ───────────────────────────────────────────────
+    # ── Response streaming ────────────────────────────────────────
 
-    async def _drain_pending(self):
-        """Display any unsolicited messages queued while user was typing."""
-        for hb in self._pending_heartbeats:
-            console.print(
-                Panel(
-                    Markdown(hb.strip()),
-                    title="[bold cyan]Agent[/bold cyan]",
-                    border_style="cyan",
-                    padding=(1, 2),
-                )
-            )
-        self._pending_heartbeats.clear()
-
+    async def _drain_pending(self) -> None:
+        """Display any messages queued between prompts."""
         labels = {
             "assistant_message": "Agent",
             "task_message": "Task",
             "heartbeat_message": "Agent",
         }
-
         while not self._msg_queue.empty():
             try:
                 msg = self._msg_queue.get_nowait()
@@ -81,71 +109,97 @@ class CLIProvider(QueuedProvider):
             except asyncio.QueueEmpty:
                 break
 
-    async def _wait_for_response(self):
-        """Show spinner while waiting for response, render each segment as a panel."""
-        collected = ""
-        label = "Agent"
-        done = False
-        next_spinner_text = " 思考中..."
+    async def _wait_for_response(self) -> None:
+        """Wait for agent response and render each message as its own Panel."""
+        task_bufs: dict[str, str] = {}
+        spinner: Live | None = None
 
-        while not done:
-            spinner = Spinner("dots", text=Text(next_spinner_text, style="dim"))
-            next_spinner_text = " 思考中..."
+        def start_spinner(text: str = " 思考中..."):
+            nonlocal spinner
+            spinner = Live(
+                Spinner("dots", text=Text(text, style="dim")),
+                console=console, transient=True, refresh_per_second=12,
+            )
+            spinner.start()
 
-            with Live(spinner, console=console, transient=True, refresh_per_second=12) as live:
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(
-                            self._msg_queue.get(), timeout=get_config().response_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        console.print("[yellow]响应超时（5分钟无活动）[/yellow]")
-                        return
+        def stop_spinner():
+            nonlocal spinner
+            if spinner:
+                spinner.stop()
+                spinner = None
 
-                    msg_type = msg.get("type")
+        start_spinner()
 
-                    if msg_type == "progress":
-                        tool = msg.get("tool", "")
-                        live.update(
-                            Spinner("dots", text=Text(f" 使用工具: {tool}", style="dim"))
-                        )
-                        continue
-
-                    if msg_type in ("assistant_message", "task_message"):
-                        content = msg.get("content", "")
-                        if content:
-                            collected += content
-                        if msg_type == "task_message":
-                            label = "Task"
-                        done = msg.get("done", True)
-                        break
-
-                    elif msg_type == "heartbeat_message":
-                        content = msg.get("content", "")
-                        if content:
-                            self._pending_heartbeats.append(content)
-                        continue
-
-                    elif msg_type == "error":
-                        console.print(
-                            f"\n[bold red]{msg.get('content', '')}[/bold red]"
-                        )
-                        return
-
-                    elif msg_type == "pong":
-                        continue
-
-            if collected.strip():
-                console.print(
-                    Panel(
-                        Markdown(collected.strip()),
-                        title=f"[bold cyan]{label}[/bold cyan]",
-                        border_style="cyan",
-                        padding=(1, 2),
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        self._msg_queue.get(),
+                        timeout=get_config().response_timeout,
                     )
-                )
-                collected = ""
-                label = "Agent"
+                except asyncio.TimeoutError:
+                    console.print("[yellow]响应超时[/yellow]")
+                    return
+
+                msg_type = msg.get("type")
+
+                if msg_type == "assistant_message":
+                    content = msg.get("content", "")
+                    if content.strip():
+                        stop_spinner()
+                        console.print(Panel(
+                            Markdown(content.strip()),
+                            title="[bold cyan]Agent[/bold cyan]",
+                            border_style="cyan",
+                            padding=(1, 2),
+                        ))
+                    if msg.get("done"):
+                        break
+                    start_spinner()
+
+                elif msg_type == "progress":
+                    stop_spinner()
+                    console.print(Text(f"  ⚙ {msg.get('tool', '')}", style="dim"))
+                    start_spinner(f" ⚙ {msg.get('tool', '')}")
+
+                elif msg_type == "task_message":
+                    content = msg.get("content", "")
+                    task_name = msg.get("task", "task")
+                    sid = msg.get("stream_id", task_name)
+                    if content:
+                        task_bufs.setdefault(sid, "")
+                        task_bufs[sid] += content
+                    if msg.get("done") and task_bufs.get(sid, "").strip():
+                        stop_spinner()
+                        console.print(Panel(
+                            Markdown(task_bufs.pop(sid).strip()),
+                            title="[bold yellow]Task[/bold yellow]",
+                            border_style="yellow",
+                            padding=(1, 2),
+                        ))
+                        start_spinner()
+
+                elif msg_type == "heartbeat_message":
+                    content = msg.get("content", "")
+                    if content.strip():
+                        stop_spinner()
+                        console.print(Panel(
+                            Markdown(content.strip()),
+                            title="[bold cyan]Agent[/bold cyan]",
+                            border_style="cyan",
+                            padding=(1, 2),
+                        ))
+                        start_spinner()
+
+                elif msg_type == "error":
+                    console.print(f"[bold red]{msg.get('content', '')}[/bold red]")
+                    return
+
+                elif msg_type == "pong":
+                    continue
+
+        finally:
+            stop_spinner()
 
     # ── Main loop ────────────────────────────────────────────────
 
@@ -178,12 +232,15 @@ class CLIProvider(QueuedProvider):
                 await self._drain_pending()
 
                 try:
-                    user_input = await self.session.prompt_async(
-                        HTML(
-                            "<ansigreen><b>You</b></ansigreen>"
-                            "<ansigray> › </ansigray>"
-                        ),
-                    )
+                    self._prompting = True
+                    with patch_stdout():
+                        user_input = await self.session.prompt_async(
+                            HTML(
+                                "<ansigreen><b>You</b></ansigreen>"
+                                "<ansigray> › </ansigray>"
+                            ),
+                        )
+                    self._prompting = False
 
                     if user_input.strip().lower() in ("/quit", "/exit"):
                         break
@@ -196,9 +253,11 @@ class CLIProvider(QueuedProvider):
                 except EOFError:
                     break
                 except KeyboardInterrupt:
+                    self._prompting = False
                     continue
 
         finally:
+            self._prompting = False
             await self.disconnect()
             console.print("\n[dim]已断开连接[/dim]")
 

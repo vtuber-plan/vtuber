@@ -12,10 +12,10 @@ from vtuber.config import (
     get_long_term_memory_path,
     get_sessions_dir,
 )
-from vtuber.daemon.agents import create_agent
+from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.streaming import collect_response, iter_response, truncate
+from vtuber.daemon.streaming import collect_oneshot, iter_oneshot, truncate
 from vtuber.templates import DEFAULT_HEARTBEAT
 
 logger = logging.getLogger("vtuber.daemon")
@@ -66,7 +66,7 @@ class HeartbeatManager:
                 logger.error("Heartbeat error: %s", e, exc_info=True)
 
     async def _execute_heartbeat(self):
-        """Two-phase heartbeat: pre-check file, then optionally call sub-agent."""
+        """Two-phase heartbeat: pre-check file, then optionally run one-shot query."""
         heartbeat_path = get_heartbeat_path()
         heartbeat_content = ""
 
@@ -77,36 +77,34 @@ class HeartbeatManager:
             logger.info("[heartbeat] skipped (default/empty HEARTBEAT.md)")
             return
 
-        logger.info("[heartbeat] tasks found, executing with sub-agent")
+        logger.info("[heartbeat] tasks found, executing one-shot query")
         try:
-            agent = await create_agent(
+            options = build_agent_options(
                 prompt_suffix=(
                     "[HEARTBEAT] 请审查以下任务清单，决定是否有需要执行的任务。\n"
                     "如果有任务需要执行，请执行它们并报告结果。\n"
                     "如果没有需要执行的任务，请只回复空内容。"
                 ),
                 include_schedule=True,
+                include_preset_tools=True,
             )
-            try:
-                collected = ""
-                async for event in iter_response(
-                    agent,
-                    f"[Heartbeat Task Checklist]\n\n{heartbeat_content}",
-                    log_source="heartbeat",
-                ):
-                    if event.type == "text":
-                        collected += event.text
+            collected = ""
+            async for event in iter_oneshot(
+                f"[Heartbeat Task Checklist]\n\n{heartbeat_content}",
+                options,
+                log_source="heartbeat",
+            ):
+                if event.type == "text":
+                    collected += event.text
 
-                if collected.strip():
-                    logger.info("[heartbeat] agent responded: %s", truncate(collected))
-                    await self.gateway.broadcast({
-                        "type": MessageType.HEARTBEAT_MESSAGE,
-                        "content": collected,
-                    })
-                else:
-                    logger.info("[heartbeat] agent found nothing to do")
-            finally:
-                await agent.disconnect()
+            if collected.strip():
+                logger.info("[heartbeat] agent responded: %s", truncate(collected))
+                await self.gateway.broadcast({
+                    "type": MessageType.HEARTBEAT_MESSAGE,
+                    "content": collected,
+                })
+            else:
+                logger.info("[heartbeat] agent found nothing to do")
 
             logger.info("[heartbeat] completed")
 
@@ -164,7 +162,7 @@ class HeartbeatManager:
                 len(new_lines), last_consolidated,
             )
 
-            agent = await create_agent(
+            options = build_agent_options(
                 system_prompt=(
                     "你是一个记忆整理助手。你的任务是：\n"
                     f"1. 阅读下面的对话记录\n"
@@ -177,15 +175,12 @@ class HeartbeatManager:
                 include_mcp_tools=False,
                 include_preset_tools=True,
             )
-            try:
-                await collect_response(
-                    agent,
-                    f"## 当前长期记忆\n\n{current_memory or '(空)'}\n\n"
-                    f"## 需要整理的对话记录\n\n{transcript}",
-                    log_source="consolidation",
-                )
-            finally:
-                await agent.disconnect()
+            await collect_oneshot(
+                f"## 当前长期记忆\n\n{current_memory or '(空)'}\n\n"
+                f"## 需要整理的对话记录\n\n{transcript}",
+                options,
+                log_source="consolidation",
+            )
 
             # Update consolidation state
             total_consolidated = last_consolidated + len(new_lines)

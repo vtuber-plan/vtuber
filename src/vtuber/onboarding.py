@@ -21,7 +21,7 @@ from claude_agent_sdk.types import (
 
 import shutil
 
-from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, get_skills_dir
+from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT, DEFAULT_CONFIG
 from vtuber.utils import extract_stream_text
 
@@ -258,13 +258,14 @@ def create_default_configs():
     if not config_path.exists():
         config_path.write_text(DEFAULT_CONFIG, encoding="utf-8")
 
-    # Copy built-in skills to user skills dir (skip existing)
+    # Copy built-in commands to workspace .claude/commands/ (Claude's native loading)
     builtin_skills = Path(__file__).parent / "skills"
-    user_skills = get_skills_dir()
+    commands_dir = ensure_workspace_dir() / ".claude" / "commands"
     if builtin_skills.is_dir():
-        user_skills.mkdir(parents=True, exist_ok=True)
+        commands_dir.mkdir(parents=True, exist_ok=True)
         for skill_dir in builtin_skills.iterdir():
             if skill_dir.is_dir() and not skill_dir.name.startswith("_"):
-                target = user_skills / skill_dir.name
-                if not target.exists():
-                    shutil.copytree(skill_dir, target)
+                skill_md = skill_dir / "SKILL.md"
+                target = commands_dir / f"{skill_dir.name}.md"
+                if not target.exists() and skill_md.exists():
+                    shutil.copy2(skill_md, target)

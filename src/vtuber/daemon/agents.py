@@ -12,22 +12,15 @@ from vtuber.persona import build_system_prompt
 logger = logging.getLogger("vtuber.daemon")
 
 
-def create_tools_server(
-    include_schedule: bool = True,
-    refresh_event: asyncio.Event | None = None,
-):
+def create_tools_server(include_schedule: bool = True):
     """Create an SDK MCP server with vtuber tools.
 
     Returns:
         (server, allowed_tool_names) tuple.
     """
-    SERVER_NAME = "vtuber-tools"
+    SERVER_NAME = "vtuber_tools"
 
     from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
-    from vtuber.tools.skills import (
-        skill_invoke, skill_create, skill_update, skill_delete, skill_refresh,
-        set_refresh_event,
-    )
 
     tools = [search_sessions, list_sessions, read_session, search_history]
     allowed = [
@@ -47,44 +40,31 @@ def create_tools_server(
             f"mcp__{SERVER_NAME}__schedule_cancel",
         ])
 
-    # Skill tools (always included)
-    tools.extend([skill_invoke, skill_create, skill_update, skill_delete, skill_refresh])
-    allowed.extend([
-        f"mcp__{SERVER_NAME}__skill_invoke",
-        f"mcp__{SERVER_NAME}__skill_create",
-        f"mcp__{SERVER_NAME}__skill_update",
-        f"mcp__{SERVER_NAME}__skill_delete",
-        f"mcp__{SERVER_NAME}__skill_refresh",
-    ])
-
-    if refresh_event is not None:
-        set_refresh_event(refresh_event)
-
     server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
     return server, allowed
 
 
-async def create_agent(
+def build_agent_options(
     *,
     system_prompt: str | None = None,
     prompt_suffix: str = "",
+    include_preset_system_prompt: bool = True,
     include_schedule: bool = False,
     include_mcp_tools: bool = True,
     include_preset_tools: bool = False,
     session_persistence: bool = False,
-    refresh_event: asyncio.Event | None = None,
     resume: bool = False,
-) -> ClaudeSDKClient:
-    """Create and connect a Claude SDK agent.
+) -> ClaudeAgentOptions:
+    """Build ClaudeAgentOptions for use with create_agent() or sdk query().
 
     Args:
         system_prompt: Custom system prompt. If None, auto-builds from persona + user.
         prompt_suffix: Text appended to the auto-built persona prompt (ignored if system_prompt is set).
+        include_preset_system_prompt: Wrap system prompt in claude_code preset.
         include_schedule: Include schedule tools in the MCP server.
         include_mcp_tools: Include the MCP tool server at all.
         include_preset_tools: Include Claude Code preset tools.
         session_persistence: Allow Claude session persistence (default: disabled).
-        refresh_event: Event to signal skill refresh (passed to tools server).
         resume: Resume an existing agent session.
     """
     if system_prompt is None:
@@ -99,12 +79,18 @@ async def create_agent(
         "cwd": str(ensure_workspace_dir()),
     }
 
+    if include_preset_system_prompt:
+        options_kwargs['system_prompt'] = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_prompt,
+        }
+
     if include_mcp_tools:
         tools_server, allowed_tools = create_tools_server(
             include_schedule=include_schedule,
-            refresh_event=refresh_event,
         )
-        options_kwargs["mcp_servers"] = {"vtuber-tools": tools_server}
+        options_kwargs["mcp_servers"] = {"vtuber_tools": tools_server}
         options_kwargs["allowed_tools"] = allowed_tools
 
     if include_preset_tools:
@@ -116,9 +102,45 @@ async def create_agent(
     if not session_persistence:
         options_kwargs["extra_args"] = {"no-session-persistence": None}
 
-    agent = ClaudeSDKClient(ClaudeAgentOptions(**options_kwargs))
+    return ClaudeAgentOptions(**options_kwargs)
+
+
+async def create_agent(
+    *,
+    system_prompt: str | None = None,
+    prompt_suffix: str = "",
+    include_preset_system_prompt: bool = True,
+    include_schedule: bool = False,
+    include_mcp_tools: bool = True,
+    include_preset_tools: bool = False,
+    session_persistence: bool = False,
+    resume: bool = False,
+) -> ClaudeSDKClient:
+    """Create and connect a persistent Claude SDK agent.
+
+    For one-shot queries, use build_agent_options() + sdk query() instead.
+    """
+    options = build_agent_options(
+        system_prompt=system_prompt,
+        prompt_suffix=prompt_suffix,
+        include_preset_system_prompt=include_preset_system_prompt,
+        include_schedule=include_schedule,
+        include_mcp_tools=include_mcp_tools,
+        include_preset_tools=include_preset_tools,
+        session_persistence=session_persistence,
+        resume=resume,
+    )
+    agent = ClaudeSDKClient(options)
     await agent.connect()
     return agent
+
+
+async def safe_disconnect(agent: ClaudeSDKClient, timeout: float = 5.0) -> None:
+    """Disconnect an agent safely with a timeout."""
+    try:
+        await asyncio.wait_for(agent.disconnect(), timeout=timeout)
+    except Exception:
+        pass
 
 
 class GroupAgentManager:
@@ -127,10 +149,18 @@ class GroupAgentManager:
     def __init__(self):
         self._agents: dict[str, ClaudeSDKClient] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._create_lock = asyncio.Lock()
 
     async def get_or_create(self, channel_id: str) -> ClaudeSDKClient:
-        """Get an existing agent for a channel, or create a new one."""
-        if channel_id not in self._agents:
+        """Get an existing agent for a channel, or create a new one (thread-safe)."""
+        if channel_id in self._agents:
+            return self._agents[channel_id]
+
+        async with self._create_lock:
+            # Double-check after acquiring lock
+            if channel_id in self._agents:
+                return self._agents[channel_id]
+
             agent = await create_agent(
                 prompt_suffix=(
                     f"你正在参与一个群聊（频道: {channel_id}）。\n"
@@ -142,13 +172,23 @@ class GroupAgentManager:
             self._agents[channel_id] = agent
             self._locks[channel_id] = asyncio.Lock()
             logger.info("[group/%s] created persistent agent", channel_id)
-        return self._agents[channel_id]
+            return agent
 
     def get_lock(self, channel_id: str) -> asyncio.Lock:
         """Get the concurrency lock for a channel's agent."""
         if channel_id not in self._locks:
             self._locks[channel_id] = asyncio.Lock()
         return self._locks[channel_id]
+
+    async def recover(self, channel_id: str) -> None:
+        """Kill and recreate the agent for a channel."""
+        from vtuber.daemon.streaming import kill_agent_process
+
+        old = self._agents.pop(channel_id, None)
+        if old:
+            kill_agent_process(old)
+            await safe_disconnect(old)
+            logger.warning("[group/%s] agent recovered", channel_id)
 
     async def close_all(self):
         """Disconnect all group agents."""
