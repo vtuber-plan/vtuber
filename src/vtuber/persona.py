@@ -4,6 +4,7 @@ from pathlib import Path
 
 from vtuber.config import get_long_term_memory_path, get_history_path, get_user_path
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
+from vtuber.tools.skills import build_skill_summary
 
 TOOLS_SECTION = """## 内置能力
 
@@ -23,6 +24,13 @@ TOOLS_SECTION = """## 内置能力
   - 示例: `trigger_type="cron", trigger_config={{"day_of_week": "mon-fri", "hour": 9, "timezone": "Asia/Shanghai"}}` — 工作日9点（上海时区）
 - **schedule_list()**: 列出所有定时任务
 - **schedule_cancel(task_id)**: 取消定时任务
+
+### 技能系统
+- **skill_invoke(skill, args?)**: 调用一个已有技能，返回其完整内容供你执行
+- **skill_create(name)**: 创建新技能目录，返回路径和 SKILL.md 写作指南
+- **skill_update(name)**: 获取技能文件路径，使用 Read/Edit 工具修改
+- **skill_delete(name)**: 删除一个技能及其目录
+- **skill_refresh()**: 刷新系统提示词以包含最新的技能描述（创建/更新/删除技能后调用）
 
 ## 记忆管理
 
@@ -81,7 +89,7 @@ def _read_long_term_memory() -> str:
 
 
 def build_system_prompt(persona_path: Path, user_path: Path) -> str:
-    """Build system prompt from persona.md, user.md, long-term memory, and tools section."""
+    """Build system prompt from persona.md, user.md, long-term memory, tools, and skills."""
     persona_content = _read_or_default(persona_path, DEFAULT_PERSONA)
     user_content = _read_or_default(user_path, DEFAULT_USER)
     tools_section = TOOLS_SECTION.format(
@@ -90,6 +98,7 @@ def build_system_prompt(persona_path: Path, user_path: Path) -> str:
         history_path=str(get_history_path()),
     )
     long_term_memory = _read_long_term_memory()
+    skill_summary = build_skill_summary()
 
     parts = [
         persona_content,
@@ -98,6 +107,9 @@ def build_system_prompt(persona_path: Path, user_path: Path) -> str:
         "---",
         tools_section,
     ]
+
+    if skill_summary:
+        parts.extend(["---", skill_summary])
 
     if long_term_memory:
         parts.extend(["---", long_term_memory])

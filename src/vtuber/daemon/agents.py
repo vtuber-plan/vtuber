@@ -12,13 +12,20 @@ from vtuber.persona import build_system_prompt
 logger = logging.getLogger("vtuber.daemon")
 
 
-def create_tools_server(include_schedule: bool = True):
+def create_tools_server(
+    include_schedule: bool = True,
+    refresh_event: asyncio.Event | None = None,
+):
     """Create an SDK MCP server with vtuber tools.
 
     Returns:
         (server, allowed_tool_names) tuple.
     """
     from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
+    from vtuber.tools.skills import (
+        skill_invoke, skill_create, skill_update, skill_delete, skill_refresh,
+        set_refresh_event,
+    )
 
     tools = [search_sessions, list_sessions, read_session, search_history]
     allowed = ["search_sessions", "list_sessions", "read_session", "search_history"]
@@ -28,6 +35,13 @@ def create_tools_server(include_schedule: bool = True):
 
         tools.extend([schedule_create, schedule_list, schedule_cancel])
         allowed.extend(["schedule_create", "schedule_list", "schedule_cancel"])
+
+    # Skill tools (always included)
+    tools.extend([skill_invoke, skill_create, skill_update, skill_delete, skill_refresh])
+    allowed.extend(["skill_invoke", "skill_create", "skill_update", "skill_delete", "skill_refresh"])
+
+    if refresh_event is not None:
+        set_refresh_event(refresh_event)
 
     server = create_sdk_mcp_server("vtuber-tools", tools=tools)
     return server, allowed
@@ -41,6 +55,8 @@ async def create_agent(
     include_mcp_tools: bool = True,
     include_preset_tools: bool = False,
     session_persistence: bool = False,
+    refresh_event: asyncio.Event | None = None,
+    resume: bool = False,
 ) -> ClaudeSDKClient:
     """Create and connect a Claude SDK agent.
 
@@ -51,6 +67,8 @@ async def create_agent(
         include_mcp_tools: Include the MCP tool server at all.
         include_preset_tools: Include Claude Code preset tools.
         session_persistence: Allow Claude session persistence (default: disabled).
+        refresh_event: Event to signal skill refresh (passed to tools server).
+        resume: Resume an existing agent session.
     """
     if system_prompt is None:
         system_prompt = build_system_prompt(get_persona_path(), get_user_path())
@@ -65,12 +83,18 @@ async def create_agent(
     }
 
     if include_mcp_tools:
-        tools_server, allowed_tools = create_tools_server(include_schedule=include_schedule)
+        tools_server, allowed_tools = create_tools_server(
+            include_schedule=include_schedule,
+            refresh_event=refresh_event,
+        )
         options_kwargs["mcp_servers"] = {"vtuber-tools": tools_server}
         options_kwargs["allowed_tools"] = allowed_tools
 
     if include_preset_tools:
         options_kwargs["tools"] = {"type": "preset", "preset": "claude_code"}
+
+    if resume:
+        options_kwargs["resume"] = True
 
     if not session_persistence:
         options_kwargs["extra_args"] = {"no-session-persistence": None}
