@@ -21,6 +21,8 @@ def create_tools_server(
     Returns:
         (server, allowed_tool_names) tuple.
     """
+    SERVER_NAME = "vtuber-tools"
+
     from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
     from vtuber.tools.skills import (
         skill_invoke, skill_create, skill_update, skill_delete, skill_refresh,
@@ -28,22 +30,37 @@ def create_tools_server(
     )
 
     tools = [search_sessions, list_sessions, read_session, search_history]
-    allowed = ["search_sessions", "list_sessions", "read_session", "search_history"]
+    allowed = [
+        f"mcp__{SERVER_NAME}__search_sessions",
+        f"mcp__{SERVER_NAME}__list_sessions",
+        f"mcp__{SERVER_NAME}__read_session",
+        f"mcp__{SERVER_NAME}__search_history",
+    ]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
 
         tools.extend([schedule_create, schedule_list, schedule_cancel])
-        allowed.extend(["schedule_create", "schedule_list", "schedule_cancel"])
+        allowed.extend([
+            f"mcp__{SERVER_NAME}__schedule_create",
+            f"mcp__{SERVER_NAME}__schedule_list",
+            f"mcp__{SERVER_NAME}__schedule_cancel",
+        ])
 
     # Skill tools (always included)
     tools.extend([skill_invoke, skill_create, skill_update, skill_delete, skill_refresh])
-    allowed.extend(["skill_invoke", "skill_create", "skill_update", "skill_delete", "skill_refresh"])
+    allowed.extend([
+        f"mcp__{SERVER_NAME}__skill_invoke",
+        f"mcp__{SERVER_NAME}__skill_create",
+        f"mcp__{SERVER_NAME}__skill_update",
+        f"mcp__{SERVER_NAME}__skill_delete",
+        f"mcp__{SERVER_NAME}__skill_refresh",
+    ])
 
     if refresh_event is not None:
         set_refresh_event(refresh_event)
 
-    server = create_sdk_mcp_server("vtuber-tools", tools=tools)
+    server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
     return server, allowed
 
 
