@@ -78,6 +78,7 @@ class DaemonServer:
         self.group_agents = GroupAgentManager()
         self.session_id = create_session_id()
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
+        self._refresh_event = asyncio.Event()
 
         # Subsystems (initialized in start())
         self._heartbeat: HeartbeatManager | None = None
@@ -112,6 +113,7 @@ class DaemonServer:
         self.agent = await create_agent(
             include_schedule=True,
             include_preset_tools=True,
+            refresh_event=self._refresh_event,
         )
         logger.info("Agent initialized")
 
@@ -263,6 +265,8 @@ class DaemonServer:
                 )
             if self._heartbeat:
                 self._heartbeat.on_message()
+            if self._refresh_event.is_set():
+                await self._do_refresh()
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -308,6 +312,25 @@ class DaemonServer:
                 "type": MessageType.ERROR,
                 "content": str(e),
             })
+
+    async def _do_refresh(self) -> None:
+        """Refresh the main agent with updated system prompt (preserving session)."""
+        self._refresh_event.clear()
+        logger.info("Refreshing agent (skill update)")
+
+        if self.agent:
+            try:
+                await self.agent.disconnect()
+            except Exception:
+                pass
+
+        self.agent = await create_agent(
+            include_schedule=True,
+            include_preset_tools=True,
+            refresh_event=self._refresh_event,
+            resume=True,
+        )
+        logger.info("Agent refreshed with updated system prompt")
 
     async def _stream_agent_response(
         self,
