@@ -104,6 +104,10 @@ def ensure_config_dir() -> Path:
     """Ensure the configuration directory exists and return its path."""
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
+
+    memory_dir = config_dir / "memory"
+    memory_dir.mkdir(exist_ok=True)
+
     return config_dir
 
 
@@ -149,19 +153,24 @@ def get_db_path() -> Path:
     return get_config_dir() / "vtuber.db"
 
 
+def get_memory_dir() -> Path:
+    """Get the memory directory path."""
+    return get_config_dir() / "memory"
+
+
 def get_sessions_dir() -> Path:
     """Get the session logs directory path."""
-    return get_config_dir() / "memory" / "sessions"
+    return get_memory_dir() / "sessions"
 
 
 def get_long_term_memory_path() -> Path:
     """Get the long-term memory markdown file path."""
-    return get_config_dir() / "long_term_memory.md"
+    return get_memory_dir() / "MEMORY.md"
 
 
 def get_history_path() -> Path:
     """Get the append-only history log file path."""
-    return get_config_dir() / "history.md"
+    return get_memory_dir() / "HISTORY.md"
 
 
 def get_consolidation_state_path() -> Path:
