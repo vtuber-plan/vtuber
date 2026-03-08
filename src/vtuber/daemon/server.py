@@ -80,7 +80,8 @@ class DaemonServer:
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._agent_lock = asyncio.Lock()
         self.group_agents = GroupAgentManager()
-        self.session_id = create_session_id()
+        self.session_id = "cli:main"  # Default CLI session
+        self.session_manager = SessionManager(get_sessions_dir())
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
 
         # Subsystems (initialized in start())
@@ -255,7 +256,9 @@ class DaemonServer:
             })
             return
 
-        log_message(self.session_id, "user", content, sender=sender)
+        session = self.session_manager.get_or_create(self.session_id)
+        session.add_message("user", content, sender=sender)
+        self.session_manager.save(session)
         logger.debug("[%s] %s", sender, truncate(content))
 
         query_content = content if is_owner else f"[{sender}]: {content}"
@@ -408,7 +411,9 @@ class DaemonServer:
                 and no_response_token in full_text.strip().upper()
             )
             if not is_no_response:
-                log_message(self.session_id, "assistant", full_text.strip())
+                session = self.session_manager.get_or_create(self.session_id)
+                session.add_message("assistant", full_text.strip())
+                self.session_manager.save(session)
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
