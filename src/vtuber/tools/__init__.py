@@ -3,8 +3,8 @@ from vtuber.tools.memory import (
     search_sessions,
     list_sessions,
     read_session,
-    log_message,
-    create_session_id,
+    Session,
+    SessionManager,
 )
 
 __all__ = [
@@ -14,6 +14,6 @@ __all__ = [
     "search_sessions",
     "list_sessions",
     "read_session",
-    "log_message",
-    "create_session_id",
+    "Session",
+    "SessionManager",
 ]
