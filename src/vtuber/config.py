@@ -180,9 +180,6 @@ def get_history_path() -> Path:
     return get_memory_dir() / "HISTORY.md"
 
 
-def get_consolidation_state_path() -> Path:
-    """Get the consolidation state file path."""
-    return get_config_dir() / "consolidation_state.json"
 
 
 def get_log_path() -> Path:
