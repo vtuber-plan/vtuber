@@ -1,4 +1,9 @@
-"""CLI provider - terminal-based chat with rich UI."""
+"""CLI provider - terminal-based chat with rich UI.
+
+Uses real terminal output: messages print directly to the scroll buffer,
+prompt_toolkit handles input at the bottom.  Each assistant_message is a
+complete, independent message and is rendered immediately as a Rich Panel.
+"""
 
 import asyncio
 import sys
@@ -23,8 +28,10 @@ console = Console()
 class CLIProvider(QueuedProvider):
     """Terminal-based provider using prompt_toolkit + rich.
 
-    Each agent response is collected fully, then rendered as a
-    Rich Markdown panel.
+    Messages print directly to the real terminal scroll buffer.
+    Each assistant_message is a complete, independent message —
+    displayed immediately upon arrival.  The ``done`` flag only
+    signals that the agent query has finished.
     """
 
     provider_type = "cli"
@@ -38,6 +45,8 @@ class CLIProvider(QueuedProvider):
         self.session = PromptSession(history=FileHistory(str(history_path)))
 
     # ── Callback overrides for INPUT phase ────────────────────────
+    # These fire when the user is at the prompt (self._prompting is True)
+    # and a background message (heartbeat/task) arrives.
 
     async def on_task(self, content: str, task: str, *, done: bool) -> None:
         if self._prompting:
@@ -48,8 +57,8 @@ class CLIProvider(QueuedProvider):
                     console.print()
                     console.print(Panel(
                         Markdown(self._task_buffer.strip()),
-                        title="[bold cyan]Task[/bold cyan]",
-                        border_style="cyan",
+                        title="[bold yellow]Task[/bold yellow]",
+                        border_style="yellow",
                         padding=(1, 2),
                     ))
                 self._task_buffer = ""
@@ -67,7 +76,7 @@ class CLIProvider(QueuedProvider):
                 console.print()
                 console.print(Panel(
                     Markdown(content.strip()),
-                    title="[bold cyan]Agent[/bold cyan]",
+                    title="[bold cyan]Heartbeat[/bold cyan]",
                     border_style="cyan",
                     padding=(1, 2),
                 ))
@@ -80,47 +89,71 @@ class CLIProvider(QueuedProvider):
     async def on_disconnected(self) -> None:
         console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
 
-    # ── Response streaming ────────────────────────────────────────
+    # ── Spinner helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _make_spinner(text: str = "思考中...") -> Live:
+        return Live(
+            Spinner("dots", text=Text(f" {text}", style="dim")),
+            console=console,
+            transient=True,
+            refresh_per_second=12,
+        )
+
+    # ── Response handling ─────────────────────────────────────────
 
     async def _drain_pending(self) -> None:
-        """Display any messages queued between prompts."""
-        labels = {
-            "assistant_message": "Agent",
-            "task_message": "Task",
-            "heartbeat_message": "Agent",
-        }
+        """Display any messages that arrived while the user was typing."""
         while not self._msg_queue.empty():
             try:
                 msg = self._msg_queue.get_nowait()
-                msg_type = msg.get("type")
-                content = msg.get("content", "")
-
-                if msg_type in labels and content.strip():
-                    console.print(
-                        Panel(
-                            Markdown(content.strip()),
-                            title=f"[bold cyan]{labels[msg_type]}[/bold cyan]",
-                            border_style="cyan",
-                            padding=(1, 2),
-                        )
-                    )
-                elif msg_type == "error":
-                    console.print(f"[bold red]{content}[/bold red]")
             except asyncio.QueueEmpty:
                 break
 
+            msg_type = msg.get("type")
+            content = msg.get("content", "")
+
+            if msg_type == "assistant_message" and content.strip():
+                console.print(Panel(
+                    Markdown(content.strip()),
+                    title="[bold cyan]Agent[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                ))
+            elif msg_type == "heartbeat_message" and content.strip():
+                console.print(Panel(
+                    Markdown(content.strip()),
+                    title="[bold cyan]Heartbeat[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                ))
+            elif msg_type == "task_message" and content.strip():
+                console.print(Panel(
+                    Markdown(content.strip()),
+                    title="[bold yellow]Task[/bold yellow]",
+                    border_style="yellow",
+                    padding=(1, 2),
+                ))
+            elif msg_type == "error" and content:
+                console.print(f"[bold red]{content}[/bold red]")
+
     async def _wait_for_response(self) -> None:
-        """Wait for agent response and render each message as its own Panel."""
+        """Wait for agent response. Each assistant_message is displayed immediately.
+
+        The ``done`` flag only signals that the agent has finished — it does
+        NOT mean "end of a streaming chunk".  Every assistant_message with
+        content is a complete, independent message and is rendered right away.
+        """
         task_bufs: dict[str, str] = {}
         spinner: Live | None = None
 
-        def start_spinner(text: str = " 思考中..."):
+        def start_spinner(text: str = "思考中..."):
             nonlocal spinner
-            spinner = Live(
-                Spinner("dots", text=Text(text, style="dim")),
-                console=console, transient=True, refresh_per_second=12,
-            )
-            spinner.start()
+            if spinner is None:
+                spinner = self._make_spinner(text)
+                spinner.start()
+            else:
+                spinner.update(Spinner("dots", text=Text(f" {text}", style="dim")))
 
         def stop_spinner():
             nonlocal spinner
@@ -138,11 +171,13 @@ class CLIProvider(QueuedProvider):
                         timeout=get_config().response_timeout,
                     )
                 except asyncio.TimeoutError:
+                    stop_spinner()
                     console.print("[yellow]响应超时[/yellow]")
                     return
 
                 msg_type = msg.get("type")
 
+                # ── Assistant message: display immediately ────────
                 if msg_type == "assistant_message":
                     content = msg.get("content", "")
                     if content.strip():
@@ -157,41 +192,44 @@ class CLIProvider(QueuedProvider):
                         break
                     start_spinner()
 
+                # ── Tool progress ─────────────────────────────────
                 elif msg_type == "progress":
-                    stop_spinner()
-                    console.print(Text(f"  ⚙ {msg.get('tool', '')}", style="dim"))
-                    start_spinner(f" ⚙ {msg.get('tool', '')}")
+                    tool = msg.get("tool", "")
+                    start_spinner(f"⚙ {tool}")
 
+                # ── Task message: buffer by task name ──────────
                 elif msg_type == "task_message":
                     content = msg.get("content", "")
                     task_name = msg.get("task", "task")
-                    sid = msg.get("stream_id", task_name)
                     if content:
-                        task_bufs.setdefault(sid, "")
-                        task_bufs[sid] += content
-                    if msg.get("done") and task_bufs.get(sid, "").strip():
+                        task_bufs.setdefault(task_name, "")
+                        task_bufs[task_name] += content
+                    if msg.get("done") and task_bufs.get(task_name, "").strip():
                         stop_spinner()
                         console.print(Panel(
-                            Markdown(task_bufs.pop(sid).strip()),
+                            Markdown(task_bufs.pop(task_name).strip()),
                             title="[bold yellow]Task[/bold yellow]",
                             border_style="yellow",
                             padding=(1, 2),
                         ))
                         start_spinner()
 
+                # ── Heartbeat: display immediately ────────────────
                 elif msg_type == "heartbeat_message":
                     content = msg.get("content", "")
                     if content.strip():
                         stop_spinner()
                         console.print(Panel(
                             Markdown(content.strip()),
-                            title="[bold cyan]Agent[/bold cyan]",
+                            title="[bold cyan]Heartbeat[/bold cyan]",
                             border_style="cyan",
                             padding=(1, 2),
                         ))
                         start_spinner()
 
+                # ── Error: display and abort ──────────────────────
                 elif msg_type == "error":
+                    stop_spinner()
                     console.print(f"[bold red]{msg.get('content', '')}[/bold red]")
                     return
 
@@ -204,7 +242,7 @@ class CLIProvider(QueuedProvider):
     # ── Main loop ────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Run the interactive CLI provider."""
+        """Run the interactive CLI — real terminal output, prompt at bottom."""
         if not await self.connect():
             console.print(
                 Panel(

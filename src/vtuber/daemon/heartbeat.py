@@ -15,10 +15,37 @@ from vtuber.config import (
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.streaming import collect_oneshot, iter_oneshot, truncate
+from vtuber.daemon.agent_query import collect_oneshot, iter_oneshot, truncate
 from vtuber.templates import DEFAULT_HEARTBEAT
 
 logger = logging.getLogger("vtuber.daemon")
+
+
+# Heartbeat tool definition (from nanobot)
+_HEARTBEAT_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "heartbeat",
+            "description": "Report heartbeat decision after reviewing tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["skip", "run"],
+                        "description": "skip = nothing to do, run = has active tasks",
+                    },
+                    "tasks": {
+                        "type": "string",
+                        "description": "Natural-language summary of active tasks (required for run)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    }
+]
 
 
 class HeartbeatManager:
@@ -65,8 +92,53 @@ class HeartbeatManager:
             except Exception as e:
                 logger.error("Heartbeat error: %s", e, exc_info=True)
 
+    async def _decide(self, heartbeat_content: str) -> tuple[str, str]:
+        """Phase 1: ask LLM to decide skip/run via virtual tool call.
+
+        Returns (action, tasks) where action is 'skip' or 'run'.
+        """
+        from claude_agent_sdk import query as sdk_query
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        options = build_agent_options(
+            system_prompt="You are a heartbeat agent. Call the heartbeat tool to report your decision.",
+            tools=_HEARTBEAT_TOOL,
+            tool_choice={"type": "tool", "name": "heartbeat"},
+            include_mcp_tools=False,
+            include_preset_tools=False,
+            include_schedule=False,
+        )
+
+        prompt = (
+            "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+            f"{heartbeat_content}"
+        )
+
+        # Collect tool call from AssistantMessage
+        tool_args = None
+        try:
+            async for msg in sdk_query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, ToolUseBlock) and block.name == "heartbeat":
+                            tool_args = block.input
+                            break
+                    if tool_args:
+                        break
+        except Exception as e:
+            logger.error("[heartbeat] decision phase error: %s", e, exc_info=True)
+            return "skip", ""
+
+        if not tool_args:
+            logger.warning("[heartbeat] no tool call found, defaulting to skip")
+            return "skip", ""
+
+        action = tool_args.get("action", "skip")
+        tasks = tool_args.get("tasks", "")
+        return action, tasks
+
     async def _execute_heartbeat(self):
-        """Two-phase heartbeat: pre-check file, then optionally run one-shot query."""
+        """Two-phase heartbeat: decision via tool call, then optional execution."""
         heartbeat_path = get_heartbeat_path()
         heartbeat_content = ""
 
@@ -77,20 +149,29 @@ class HeartbeatManager:
             logger.info("[heartbeat] skipped (default/empty HEARTBEAT.md)")
             return
 
-        logger.info("[heartbeat] tasks found, executing one-shot query")
+        logger.info("[heartbeat] checking for tasks...")
+
         try:
+            # Phase 1: Decision
+            action, tasks = await self._decide(heartbeat_content)
+
+            if action != "run":
+                logger.info("[heartbeat] OK (nothing to report)")
+                return
+
+            # Phase 2: Execution
+            logger.info("[heartbeat] tasks found, executing...")
             options = build_agent_options(
                 prompt_suffix=(
-                    "[HEARTBEAT] 请审查以下任务清单，决定是否有需要执行的任务。\n"
-                    "如果有任务需要执行，请执行它们并报告结果。\n"
-                    "如果没有需要执行的任务，请只回复空内容。"
+                    "[HEARTBEAT] 请执行以下任务并报告结果。"
                 ),
                 include_schedule=True,
                 include_preset_tools=True,
             )
+
             collected = ""
             async for event in iter_oneshot(
-                f"[Heartbeat Task Checklist]\n\n{heartbeat_content}",
+                f"[Heartbeat Tasks]\n\n{tasks}",
                 options,
                 log_source="heartbeat",
             ):
@@ -103,8 +184,6 @@ class HeartbeatManager:
                     "type": MessageType.HEARTBEAT_MESSAGE,
                     "content": collected,
                 })
-            else:
-                logger.info("[heartbeat] agent found nothing to do")
 
             logger.info("[heartbeat] completed")
 

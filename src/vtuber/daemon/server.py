@@ -21,15 +21,16 @@ from vtuber.config import (
     get_log_path,
     get_pid_path,
     get_socket_path,
+    get_sessions_dir,
 )
 from vtuber.daemon.agents import GroupAgentManager, create_agent, safe_disconnect
 from vtuber.daemon.gateway import Gateway, ProviderConnection
 from vtuber.daemon.heartbeat import HeartbeatManager
 from vtuber.daemon.protocol import MessageType, decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.daemon.streaming import AgentTimeoutError, iter_response, kill_agent_process, truncate
+from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, kill_agent_process, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
-from vtuber.tools.memory import create_session_id, log_message
+from vtuber.tools.memory import SessionManager
 from vtuber.tools.schedule import set_scheduler, set_task_queue
 
 logger = logging.getLogger("vtuber.daemon")
@@ -263,7 +264,7 @@ class DaemonServer:
             logger.debug("Acquiring agent lock...")
             async with self._agent_lock:
                 logger.debug("Agent lock acquired, sending query")
-                await self._stream_agent_response(
+                await self._run_agent_query(
                     self.agent, query_content, provider_id, "agent",
                 )
             if self._heartbeat:
@@ -310,7 +311,7 @@ class DaemonServer:
             lock = self.group_agents.get_lock(channel_label)
 
             async with lock:
-                await self._stream_agent_response(
+                await self._run_agent_query(
                     agent, query_text, provider_id, f"group/{channel_label}",
                     no_response_token="NO_RESPONSE",
                 )
@@ -338,7 +339,7 @@ class DaemonServer:
         )
         logger.info("Agent recovered (new session)")
 
-    async def _stream_agent_response(
+    async def _run_agent_query(
         self,
         agent: ClaudeSDKClient,
         query: str,
@@ -347,13 +348,16 @@ class DaemonServer:
         *,
         no_response_token: str | None = None,
     ):
-        """Send a query to an agent and stream the response to a provider.
+        """Run an agent query and forward each step to the provider.
+
+        A single query may produce multiple steps: text messages,
+        tool-use progress, and a final done signal.  Each text step
+        is sent as a complete, independent assistant_message.
 
         Guarantees that a done=True message is always sent, even on error.
         """
-        stream_id = f"stream_{provider_id}"
-        index = 0
-        assistant_text = ""
+        step = 0
+        full_text = ""
         done_sent = False
 
         try:
@@ -364,24 +368,22 @@ class DaemonServer:
                         "tool": event.tool,
                     })
                 elif event.type == "text":
-                    assistant_text += event.text
+                    full_text += event.text
                     await self.gateway.send_to(provider_id, {
                         "type": MessageType.ASSISTANT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
+                        "step": step,
                         "content": event.text,
                         "done": False,
                     })
-                    index += 1
+                    step += 1
                 elif event.type == "result":
                     is_no_response = (
                         no_response_token
-                        and no_response_token in assistant_text.strip().upper()
+                        and no_response_token in full_text.strip().upper()
                     )
                     final_msg = {
                         "type": MessageType.ASSISTANT_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
+                        "step": step,
                         "content": "",
                         "done": True,
                     }
@@ -391,24 +393,22 @@ class DaemonServer:
                     await self.gateway.send_to(provider_id, final_msg)
                     done_sent = True
         finally:
-            # Always send done=True so the client never hangs waiting for it.
             if not done_sent:
                 logger.debug("[%s] sending fallback done signal", log_source)
                 await self.gateway.send_to(provider_id, {
                     "type": MessageType.ASSISTANT_MESSAGE,
-                    "stream_id": stream_id,
-                    "index": index,
+                    "step": step,
                     "content": "",
                     "done": True,
                 })
 
-        if assistant_text.strip():
+        if full_text.strip():
             is_no_response = (
                 no_response_token
-                and no_response_token in assistant_text.strip().upper()
+                and no_response_token in full_text.strip().upper()
             )
             if not is_no_response:
-                log_message(self.session_id, "assistant", assistant_text.strip())
+                log_message(self.session_id, "assistant", full_text.strip())
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

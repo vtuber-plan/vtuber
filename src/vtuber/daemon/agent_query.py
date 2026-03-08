@@ -149,8 +149,8 @@ async def iter_response(
             yield AgentEvent(type="tool", tool=tool_name)
             continue
 
-        # Skip text from AssistantMessage — it duplicates streaming deltas.
-        if isinstance(msg, AssistantMessage):
+        # Only process AssistantMessage, skip StreamEvent deltas
+        if isinstance(msg, StreamEvent):
             continue
 
         text = extract_stream_text(msg)
@@ -196,8 +196,8 @@ async def iter_oneshot(
             yield AgentEvent(type="tool", tool=tool_name)
             continue
 
-        # Skip text from AssistantMessage — it duplicates streaming deltas.
-        if isinstance(msg, AssistantMessage):
+        # Only process AssistantMessage, skip StreamEvent deltas
+        if isinstance(msg, StreamEvent):
             continue
 
         text = extract_stream_text(msg)

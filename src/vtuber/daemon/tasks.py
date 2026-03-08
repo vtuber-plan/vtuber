@@ -6,7 +6,7 @@ import logging
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.streaming import iter_oneshot, truncate
+from vtuber.daemon.agent_query import iter_oneshot, truncate
 
 logger = logging.getLogger("vtuber.daemon")
 
@@ -56,8 +56,7 @@ class ScheduledTaskRunner:
                 include_schedule=True,
                 include_preset_tools=True,
             )
-            stream_id = f"task_{id(options)}"
-            index = 0
+            step = 0
 
             async for event in iter_oneshot(
                 f"[Scheduled Task] {task_prompt}",
@@ -72,18 +71,16 @@ class ScheduledTaskRunner:
                 elif event.type == "text":
                     await self.gateway.broadcast({
                         "type": MessageType.TASK_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
+                        "step": step,
                         "content": event.text,
                         "task": task_prompt,
                         "done": False,
                     })
-                    index += 1
+                    step += 1
                 elif event.type == "result":
                     await self.gateway.broadcast({
                         "type": MessageType.TASK_MESSAGE,
-                        "stream_id": stream_id,
-                        "index": index,
+                        "step": step,
                         "content": "",
                         "task": task_prompt,
                         "done": True,
