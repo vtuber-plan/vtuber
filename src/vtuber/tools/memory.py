@@ -1,6 +1,7 @@
 """Memory system — short-term session logs + long-term persistent memory."""
 
 import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,34 @@ from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
 from vtuber.config import get_sessions_dir, ensure_sessions_dir, get_history_path
+
+
+@dataclass
+class Session:
+    """
+    A conversation session.
+
+    Stores messages in JSONL format for easy persistence.
+    Messages are append-only for LLM cache efficiency.
+    """
+
+    key: str  # channel:chat_id (e.g., "cli:main", "discord:user_123")
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    last_consolidated: int = 0  # Number of messages already consolidated
+
+    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
+        """Add a message to the session."""
+        msg = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            **kwargs
+        }
+        self.messages.append(msg)
+        self.updated_at = datetime.now()
 
 
 # --- Helper functions (called by daemon, not tools) ---
