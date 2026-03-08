@@ -20,14 +20,13 @@ def create_tools_server(include_schedule: bool = True):
     """
     SERVER_NAME = "vtuber_tools"
 
-    from vtuber.tools.memory import search_sessions, list_sessions, read_session, search_history
+    from vtuber.tools.memory import search_sessions, list_sessions, read_session
 
-    tools = [search_sessions, list_sessions, read_session, search_history]
+    tools = [search_sessions, list_sessions, read_session]
     allowed = [
         f"mcp__{SERVER_NAME}__search_sessions",
         f"mcp__{SERVER_NAME}__list_sessions",
         f"mcp__{SERVER_NAME}__read_session",
-        f"mcp__{SERVER_NAME}__search_history",
     ]
 
     if include_schedule:
