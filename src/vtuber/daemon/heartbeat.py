@@ -6,8 +6,6 @@ import logging
 
 from vtuber.config import (
     get_config,
-    get_consolidation_state_path,
-    get_heartbeat_path,
     get_history_path,
     get_long_term_memory_path,
     get_sessions_dir,
@@ -15,8 +13,7 @@ from vtuber.config import (
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.agent_query import collect_oneshot, iter_oneshot, truncate
-from vtuber.templates import DEFAULT_HEARTBEAT
+from vtuber.tools.memory import SessionManager
 
 logger = logging.getLogger("vtuber.daemon")
 
@@ -42,6 +39,34 @@ _HEARTBEAT_TOOL = [
                     },
                 },
                 "required": ["action"],
+            },
+        },
+    }
+]
+
+
+# Save memory tool definition (from nanobot)
+_SAVE_MEMORY_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "Save the memory consolidation result to persistent storage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "history_entry": {
+                        "type": "string",
+                        "description": "A paragraph (2-5 sentences) summarizing key events/decisions/topics. "
+                        "Start with [YYYY-MM-DD HH:MM]. Include detail useful for grep search.",
+                    },
+                    "memory_update": {
+                        "type": "string",
+                        "description": "Full updated long-term memory as markdown. Include all existing "
+                        "facts plus new ones. Return unchanged if nothing new.",
+                    },
+                },
+                "required": ["history_entry", "memory_update"],
             },
         },
     }
@@ -191,87 +216,110 @@ class HeartbeatManager:
             logger.error("[heartbeat] error: %s", e, exc_info=True)
 
     async def _consolidate(self):
-        """Auto-consolidate session messages into long-term memory + history log."""
+        """Auto-consolidate session messages into MEMORY.md + HISTORY.md via tool call."""
+        from vtuber.config import get_sessions_dir
+        from vtuber.tools.memory import SessionManager
+
         self._consolidation_running = True
         try:
-            session_path = get_sessions_dir() / f"{self.session_id}.jsonl"
-            if not session_path.exists():
+            sessions_dir = get_sessions_dir()
+            manager = SessionManager(sessions_dir)
+            session = manager.get_or_create(self.session_id)
+
+            # Check if consolidation needed
+            keep_count = 25  # Keep last 25 messages
+            if len(session.messages) <= keep_count:
+                return
+            if len(session.messages) - session.last_consolidated <= 0:
                 return
 
-            # Read consolidation state
-            state_path = get_consolidation_state_path()
-            last_consolidated = 0
-            if state_path.exists():
-                try:
-                    state = json.loads(state_path.read_text(encoding="utf-8"))
-                    if state.get("session_id") == self.session_id:
-                        last_consolidated = state.get("last_consolidated", 0)
-                except Exception:
-                    pass
-
-            lines = session_path.read_text(encoding="utf-8").strip().split("\n")
-            new_lines = lines[last_consolidated:]
-            if len(new_lines) < 20:
+            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if not old_messages:
                 return
 
-            # Build readable transcript
-            transcript_parts = []
-            for raw_line in new_lines:
-                try:
-                    entry = json.loads(raw_line)
-                    ts = entry.get("timestamp", "?")[:16]
-                    role = entry.get("role", "?")
-                    content = entry.get("content", "")[:500]
-                    transcript_parts.append(f"[{ts}] {role}: {content}")
-                except json.JSONDecodeError:
+            logger.info(
+                "[consolidation] starting: %d messages to consolidate",
+                len(old_messages),
+            )
+
+            # Build transcript
+            lines = []
+            for m in old_messages:
+                if not m.get("content"):
                     continue
+                ts = m.get("timestamp", "?")[:16]
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                lines.append(f"[{ts}] {role.upper()}: {content}")
 
-            if not transcript_parts:
+            if not lines:
                 return
 
-            transcript = "\n".join(transcript_parts)
             memory_path = get_long_term_memory_path()
-            history_path = get_history_path()
             current_memory = ""
             if memory_path.exists():
                 current_memory = memory_path.read_text(encoding="utf-8").strip()
 
-            logger.info(
-                "[consolidation] starting: %d new messages (from %d)",
-                len(new_lines), last_consolidated,
-            )
+            prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+
+## Current Long-term Memory
+{current_memory or "(empty)"}
+
+## Conversation to Process
+{chr(10).join(lines)}"""
+
+            # Call LLM with save_memory tool
+            from claude_agent_sdk import query as sdk_query
+            from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
 
             options = build_agent_options(
-                system_prompt=(
-                    "你是一个记忆整理助手。你的任务是：\n"
-                    f"1. 阅读下面的对话记录\n"
-                    f"2. 将有价值的长期事实更新到 {memory_path}\n"
-                    f"3. 在 {history_path} 末尾追加一段摘要（以 [YYYY-MM-DD HH:MM] 开头）\n\n"
-                    "长期记忆应该按主题组织，保持简洁（不超过200行）。\n"
-                    "历史摘要应该是2-5句话，概括对话中的关键事件和决策。\n"
-                    "不要删除长期记忆中已有的仍然有效的内容。"
-                ),
+                system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+                tools=_SAVE_MEMORY_TOOL,
+                tool_choice={"type": "tool", "name": "save_memory"},
                 include_mcp_tools=False,
-                include_preset_tools=True,
-            )
-            await collect_oneshot(
-                f"## 当前长期记忆\n\n{current_memory or '(空)'}\n\n"
-                f"## 需要整理的对话记录\n\n{transcript}",
-                options,
-                log_source="consolidation",
+                include_preset_tools=False,
+                include_schedule=False,
             )
 
-            # Update consolidation state
-            total_consolidated = last_consolidated + len(new_lines)
-            state_path.write_text(
-                json.dumps({
-                    "session_id": self.session_id,
-                    "last_consolidated": total_consolidated,
-                }),
-                encoding="utf-8",
-            )
-            self.message_count = 0
-            logger.info("[consolidation] completed: consolidated up to message %d", total_consolidated)
+            tool_args = None
+            try:
+                async for msg in sdk_query(prompt=prompt, options=options):
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, ToolUseBlock) and block.name == "save_memory":
+                                tool_args = block.input
+                                break
+                        if tool_args:
+                            break
+            except Exception as e:
+                logger.error("[consolidation] error: %s", e, exc_info=True)
+                return
+
+            if not tool_args:
+                logger.warning("[consolidation] LLM did not call save_memory tool")
+                return
+
+            # Process results
+            from vtuber.config import get_history_path
+
+            if entry := tool_args.get("history_entry"):
+                if not isinstance(entry, str):
+                    entry = json.dumps(entry, ensure_ascii=False)
+                history_path = get_history_path()
+                with open(history_path, "a", encoding="utf-8") as f:
+                    f.write(entry.rstrip() + "\n\n")
+
+            if update := tool_args.get("memory_update"):
+                if not isinstance(update, str):
+                    update = json.dumps(update, ensure_ascii=False)
+                if update != current_memory:
+                    memory_path.write_text(update, encoding="utf-8")
+
+            # Update session metadata
+            session.last_consolidated = len(session.messages) - keep_count
+            manager.save(session)
+
+            logger.info("[consolidation] completed: consolidated up to message %d", session.last_consolidated)
 
         except Exception as e:
             logger.error("[consolidation] error: %s", e, exc_info=True)
