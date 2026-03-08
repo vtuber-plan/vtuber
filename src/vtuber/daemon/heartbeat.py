@@ -6,6 +6,7 @@ import logging
 
 from vtuber.config import (
     get_config,
+    get_heartbeat_path,
     get_history_path,
     get_long_term_memory_path,
     get_sessions_dir,
@@ -13,7 +14,8 @@ from vtuber.config import (
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.tools.memory import SessionManager
+from vtuber.daemon.agent_query import iter_oneshot, truncate
+from vtuber.templates import DEFAULT_HEARTBEAT
 
 logger = logging.getLogger("vtuber.daemon")
 
