@@ -71,6 +71,11 @@ log_level: INFO
 # CLI 响应超时（秒）
 response_timeout: 300
 
+# Agent 允许写入的目录列表
+# 使用 Edit / Write / MultiEdit 工具时只有这些目录下的文件会被放行
+allowed_write_dirs:
+  - ~/.vtuber
+
 # Provider 配置（按平台名分区，配置 owner_id 以识别主人）
 # providers:
 #   discord:

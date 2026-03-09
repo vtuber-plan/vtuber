@@ -19,7 +19,7 @@ grep -i "keyword" ~/.vtuber/memory/HISTORY.md
 
 ## When to Update MEMORY.md
 
-Write important facts immediately using Read/Write/Edit:
+Write important facts immediately using Tools:
 - User preferences
 - Project context
 - Important relationships

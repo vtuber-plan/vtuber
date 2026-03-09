@@ -21,7 +21,7 @@ from claude_agent_sdk.types import (
 
 import shutil
 
-from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir
+from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir, ensure_plugins_dir
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT, DEFAULT_CONFIG
 from vtuber.utils import extract_stream_text
 
@@ -269,3 +269,13 @@ def create_default_configs():
                 target = commands_dir / f"{skill_dir.name}.md"
                 if not target.exists() and skill_md.exists():
                     shutil.copy2(skill_md, target)
+
+    # Release built-in plugins to ~/.vtuber/plugins/
+    builtin_plugins = Path(__file__).parent / "plugins"
+    plugins_dir = ensure_plugins_dir()
+    if builtin_plugins.is_dir():
+        for plugin_dir in builtin_plugins.iterdir():
+            if plugin_dir.is_dir() and not plugin_dir.name.startswith(("_", ".")):
+                target = plugins_dir / plugin_dir.name
+                if not target.exists():
+                    shutil.copytree(plugin_dir, target)

@@ -6,7 +6,8 @@ import logging
 from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk.types import ClaudeAgentOptions
 
-from vtuber.config import ensure_workspace_dir, get_config, get_persona_path, get_user_path
+from vtuber.config import ensure_workspace_dir, get_config, get_persona_path, get_user_path, get_plugins_dir
+from vtuber.permissions import agent_permission_handler
 from vtuber.persona import build_system_prompt
 
 logger = logging.getLogger("vtuber.daemon")
@@ -18,27 +19,17 @@ def create_tools_server(include_schedule: bool = True):
     Returns:
         (server, allowed_tool_names) tuple.
     """
-    SERVER_NAME = "vtuber_tools"
+    SERVER_NAME = "vtuber"
 
     from vtuber.tools.memory import search_sessions, list_sessions, read_session
 
     tools = [search_sessions, list_sessions, read_session]
-    allowed = [
-        f"mcp__{SERVER_NAME}__search_sessions",
-        f"mcp__{SERVER_NAME}__list_sessions",
-        f"mcp__{SERVER_NAME}__read_session",
-    ]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
-
         tools.extend([schedule_create, schedule_list, schedule_cancel])
-        allowed.extend([
-            f"mcp__{SERVER_NAME}__schedule_create",
-            f"mcp__{SERVER_NAME}__schedule_list",
-            f"mcp__{SERVER_NAME}__schedule_cancel",
-        ])
 
+    allowed = [f"mcp__{SERVER_NAME}__{i.name}" for i in tools]
     server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
     return server, allowed
 
@@ -74,9 +65,21 @@ def build_agent_options(
     options_kwargs: dict = {
         "system_prompt": system_prompt,
         "permission_mode": "bypassPermissions",
+        "can_use_tool": agent_permission_handler,
         "cli_path": get_config().cli_path,
         "cwd": str(ensure_workspace_dir()),
     }
+
+    # Load plugins from ~/.vtuber/plugins/
+    plugins_dir = get_plugins_dir()
+    if plugins_dir.is_dir():
+        plugin_configs = [
+            {"type": "local", "path": str(p)}
+            for p in sorted(plugins_dir.iterdir())
+            if p.is_dir() and not p.name.startswith(("_", "."))
+        ]
+        if plugin_configs:
+            options_kwargs["plugins"] = plugin_configs
 
     if include_preset_system_prompt:
         options_kwargs['system_prompt'] = {
@@ -181,7 +184,7 @@ class GroupAgentManager:
 
     async def recover(self, channel_id: str) -> None:
         """Kill and recreate the agent for a channel."""
-        from vtuber.daemon.streaming import kill_agent_process
+        from vtuber.daemon.agent_query import kill_agent_process
 
         old = self._agents.pop(channel_id, None)
         if old:

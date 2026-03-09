@@ -50,6 +50,10 @@ class VTuberConfig(BaseModel):
         default_factory=dict,
         description="Per-provider settings (e.g., discord.owner_id)",
     )
+    allowed_write_dirs: list[str] = Field(
+        default_factory=lambda: ["~/.vtuber"],
+        description="Directories where the agent is allowed to write files",
+    )
 
     def get_provider_config(self, provider_type: str) -> ProviderConfig:
         """Get config for a specific provider type."""
@@ -180,6 +184,18 @@ def get_history_path() -> Path:
     return get_memory_dir() / "HISTORY.md"
 
 
+
+
+def get_plugins_dir() -> Path:
+    """Get the plugins directory path (~/.vtuber/plugins)."""
+    return get_config_dir() / "plugins"
+
+
+def ensure_plugins_dir() -> Path:
+    """Ensure the plugins directory exists and return its path."""
+    plugins_dir = get_plugins_dir()
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    return plugins_dir
 
 
 def get_log_path() -> Path:

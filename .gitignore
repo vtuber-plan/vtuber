@@ -14,3 +14,6 @@ wheels/
 
 # Git worktrees
 .worktrees/
+
+# ref
+Claude-Agent-SDK-Reference.md
