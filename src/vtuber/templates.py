@@ -1,5 +1,7 @@
 """Default configuration templates."""
 
+CONFIG_VERSION = 1
+
 DEFAULT_PERSONA = """# Persona Configuration
 
 ## Basic Info
@@ -55,6 +57,9 @@ If this file has no tasks (only headers and comments), the agent will skip the h
 DEFAULT_CONFIG = """\
 # VTuber 配置文件
 # 修改后重启 daemon 生效: vtuber restart
+
+# 配置版本号（升级时自动迁移，请勿手动修改）
+config_version: 1
 
 # Agent 工作目录
 workspace: ~/.vtuber/workspace

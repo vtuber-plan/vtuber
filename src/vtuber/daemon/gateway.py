@@ -25,7 +25,7 @@ class ProviderConnection:
             await self.writer.drain()
             return True
         except Exception as e:
-            logger.error(
+            logger.debug(
                 "Failed to send to %s/%s: %s",
                 self.provider_type,
                 self.provider_id,
@@ -82,9 +82,11 @@ class Gateway:
         """Send a message to a specific provider. Returns False if not found or failed."""
         conn = self.connections.get(provider_id)
         if conn is None:
-            logger.warning("send_to: provider %s not found", provider_id)
             return False
-        return await conn.send(msg)
+        ok = await conn.send(msg)
+        if not ok:
+            await self.unregister(provider_id)
+        return ok
 
     async def broadcast(self, msg: dict) -> None:
         """Send a message to all connected providers."""

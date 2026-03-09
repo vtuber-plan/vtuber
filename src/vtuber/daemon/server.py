@@ -22,6 +22,8 @@ from vtuber.config import (
     get_pid_path,
     get_socket_path,
     get_sessions_dir,
+    migrate_config,
+    reset_config,
 )
 from vtuber.daemon.agents import GroupAgentManager, create_agent, safe_disconnect
 from vtuber.daemon.gateway import Gateway, ProviderConnection
@@ -96,6 +98,7 @@ class DaemonServer:
 
         from vtuber.onboarding import create_default_configs
         create_default_configs()
+        migrate_config()
 
         # Remove old socket
         if self.socket_path.exists():
@@ -235,6 +238,9 @@ class DaemonServer:
                 writer.write(response.encode("utf-8"))
                 await writer.drain()
 
+            elif msg_type == MessageType.RELOAD:
+                asyncio.create_task(self._handle_reload(writer))
+
             else:
                 logger.warning("Unknown message type: %s", msg_type)
 
@@ -341,6 +347,43 @@ class DaemonServer:
             include_preset_tools=True,
         )
         logger.info("Agent recovered (new session)")
+
+    async def _handle_reload(self, writer: asyncio.StreamWriter) -> None:
+        """Reload agents with fresh prompts (hot-reload)."""
+        logger.info("Reload requested — rebuilding agents with fresh prompts")
+        try:
+            async with self._agent_lock:
+                reset_config()
+
+                if self.agent:
+                    kill_agent_process(self.agent)
+                    await safe_disconnect(self.agent)
+                    self.agent = None
+
+                self.agent = await create_agent(
+                    include_schedule=True,
+                    include_preset_tools=True,
+                )
+
+            await self.group_agents.close_all()
+
+            logger.info("Reload complete — agents rebuilt")
+            response = encode_message({
+                "type": MessageType.PONG,
+                "message": "reload ok",
+            })
+        except Exception as e:
+            logger.error("Reload failed: %s", e, exc_info=True)
+            response = encode_message({
+                "type": MessageType.ERROR,
+                "content": f"reload failed: {e}",
+            })
+
+        try:
+            writer.write(response.encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
 
     async def _run_agent_query(
         self,

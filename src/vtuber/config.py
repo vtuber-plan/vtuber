@@ -23,6 +23,10 @@ class ProviderConfig(BaseModel):
 class VTuberConfig(BaseModel):
     """User-configurable settings loaded from ~/.vtuber/config.yaml."""
 
+    config_version: int = Field(
+        default=0,
+        description="Config schema version (do not edit manually)",
+    )
     workspace: str = Field(
         default="~/.vtuber/workspace",
         description="Agent working directory",
@@ -94,6 +98,40 @@ def reset_config() -> None:
     """Reset the cached config (forces reload on next get_config() call)."""
     global _config
     _config = None
+
+
+def migrate_config() -> None:
+    """Migrate config.yaml to the latest version, adding missing fields."""
+    from vtuber.templates import CONFIG_VERSION, DEFAULT_CONFIG
+
+    config_path = get_config_path()
+    if not config_path.exists():
+        return
+
+    raw_text = config_path.read_text(encoding="utf-8")
+    user_data = yaml.safe_load(raw_text)
+    if not isinstance(user_data, dict):
+        user_data = {}
+
+    user_version = user_data.get("config_version", 0)
+    if user_version >= CONFIG_VERSION:
+        return
+
+    defaults = yaml.safe_load(DEFAULT_CONFIG)
+    if not isinstance(defaults, dict):
+        return
+
+    for key, value in defaults.items():
+        if key not in user_data:
+            user_data[key] = value
+
+    user_data["config_version"] = CONFIG_VERSION
+
+    output = "# VTuber 配置文件\n# 修改后重启 daemon 生效: vtuber restart\n\n"
+    output += yaml.dump(user_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    config_path.write_text(output, encoding="utf-8")
+
+    reset_config()
 
 
 # ── Config directory and file paths ─────────────────────────────────

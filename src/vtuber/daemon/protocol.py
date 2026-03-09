@@ -12,6 +12,7 @@ class MessageType(str, Enum):
     REGISTER = "register"
     USER_MESSAGE = "user_message"
     PING = "ping"
+    RELOAD = "reload"
 
     # Gateway → Provider
     ASSISTANT_MESSAGE = "assistant_message"
