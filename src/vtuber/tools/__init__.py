@@ -6,6 +6,7 @@ from vtuber.tools.memory import (
     Session,
     SessionManager,
 )
+from vtuber.tools.web import web_search, web_fetch
 
 __all__ = [
     "schedule_create",
@@ -16,4 +17,6 @@ __all__ = [
     "read_session",
     "Session",
     "SessionManager",
+    "web_search",
+    "web_fetch",
 ]

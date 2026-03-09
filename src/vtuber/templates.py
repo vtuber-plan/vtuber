@@ -1,6 +1,6 @@
 """Default configuration templates."""
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 DEFAULT_PERSONA = """# Persona Configuration
 
@@ -87,4 +87,7 @@ allowed_write_dirs:
 #     owner_id: "123456789012345678"
 #   telegram:
 #     owner_id: "112233"
+
+# Tavily API key（用于 web_search 工具，从 https://tavily.com 获取）
+# tavily_api_key: "tvly-xxxxx"
 """

@@ -58,6 +58,10 @@ class VTuberConfig(BaseModel):
         default_factory=lambda: ["~/.vtuber"],
         description="Directories where the agent is allowed to write files",
     )
+    tavily_api_key: str = Field(
+        default="",
+        description="Tavily API key for web search (get one at https://tavily.com)",
+    )
 
     def get_provider_config(self, provider_type: str) -> ProviderConfig:
         """Get config for a specific provider type."""

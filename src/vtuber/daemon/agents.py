@@ -22,8 +22,9 @@ def create_tools_server(include_schedule: bool = True):
     SERVER_NAME = "vtuber"
 
     from vtuber.tools.memory import search_sessions, list_sessions, read_session
+    from vtuber.tools.web import web_search, web_fetch
 
-    tools = [search_sessions, list_sessions, read_session]
+    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
@@ -71,15 +72,15 @@ def build_agent_options(
     }
 
     # Load plugins from ~/.vtuber/plugins/
-    plugins_dir = get_plugins_dir()
-    if plugins_dir.is_dir():
-        plugin_configs = [
-            {"type": "local", "path": str(p)}
-            for p in sorted(plugins_dir.iterdir())
-            if p.is_dir() and not p.name.startswith(("_", "."))
-        ]
-        if plugin_configs:
-            options_kwargs["plugins"] = plugin_configs
+    # plugins_dir = get_plugins_dir()
+    # if plugins_dir.is_dir():
+    #     plugin_configs = [
+    #         {"type": "local", "path": str(p)}
+    #         for p in sorted(plugins_dir.iterdir())
+    #         if p.is_dir() and not p.name.startswith(("_", "."))
+    #     ]
+    #     if plugin_configs:
+    #         options_kwargs["plugins"] = plugin_configs
 
     if include_preset_system_prompt:
         options_kwargs['system_prompt'] = {
