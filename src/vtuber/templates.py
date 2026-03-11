@@ -65,10 +65,10 @@ config_version: 1
 workspace: ~/.vtuber/workspace
 
 # 心跳间隔（分钟）
-heartbeat_interval: 5
+heartbeat_interval: 30
 
 # Claude CLI 路径
-cli_path: claude
+cli_path: ripperdoc
 
 # 日志级别: DEBUG / INFO / WARNING / ERROR
 log_level: INFO
@@ -83,6 +83,14 @@ allowed_write_dirs:
 
 # Provider 配置（按平台名分区，配置 owner_id 以识别主人）
 # providers:
+#   onebot:
+#     ws_url: "ws://127.0.0.1:6700"  # OneBot 正向 WebSocket 地址
+#     access_token: ""                 # 可选，OneBot access_token
+#     owner_id: "1134505018"            # 主人的 QQ 号
+#     user_whitelist:                  # 私聊白名单（留空则允许所有人，owner 始终放行）
+#       - "1134505018"
+#     group_whitelist:                 # 群聊白名单（留空则允许所有群）
+#       - "673521165"
 #   discord:
 #     owner_id: "123456789012345678"
 #   telegram:

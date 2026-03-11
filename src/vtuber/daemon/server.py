@@ -418,6 +418,7 @@ class DaemonServer:
                     await self.gateway.send_to(provider_id, {
                         "type": MessageType.PROGRESS,
                         "tool": event.tool,
+                        "session_id": session_id,
                     })
                 elif event.type == "text":
                     full_text += event.text
@@ -426,6 +427,7 @@ class DaemonServer:
                         "step": step,
                         "content": event.text,
                         "done": False,
+                        "session_id": session_id,
                     })
                     step += 1
                 elif event.type == "result":
@@ -438,6 +440,7 @@ class DaemonServer:
                         "step": step,
                         "content": "",
                         "done": True,
+                        "session_id": session_id,
                     }
                     if is_no_response:
                         logger.debug("[%s] agent chose not to respond", log_source)
@@ -452,6 +455,7 @@ class DaemonServer:
                     "step": step,
                     "content": "",
                     "done": True,
+                    "session_id": session_id,
                 })
 
         if full_text.strip():

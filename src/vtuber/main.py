@@ -60,6 +60,7 @@ USAGE = """\
   [green]status[/green]       查看 daemon 状态
   [green]chat[/green]         连接 daemon 开始对话
   [green]mock-group[/green]   模拟群聊测试
+  [green]onebot[/green]       连接 OneBot v11 实现
   [green]restart[/green]      重启 daemon
   [green]reload[/green]       热重载提示词（无需重启）
 """
@@ -88,6 +89,9 @@ def main():
     elif command == "mock-group":
         from vtuber.providers.mock_group import main as mock_main
         mock_main()
+    elif command == "onebot":
+        from vtuber.providers.onebot import main as onebot_main
+        onebot_main()
     elif command == "restart":
         from vtuber.daemon.server import stop_daemon, start_daemon_background
         stop_daemon()

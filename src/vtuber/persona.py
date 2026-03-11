@@ -8,14 +8,13 @@ from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
 TOOLS_SECTION = """## Memory System
 
 - `memory/MEMORY.md` — Long-term facts (preferences, context). Always in your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded. Search with grep.
+- Past conversations are automatically summarized and stored. Use `search_sessions` to search them.
 
-## Search Past Events
+## Searching Past Memories
 
-Use Bash tool:
-```bash
-grep -i "keyword" ~/.vtuber/memory/HISTORY.md
-```
+Use the `search_sessions` tool:
+- `source="summary"` (default) — Search consolidated summaries. Fast, good for most recall.
+- `source="detailed"` — Search raw conversation logs. Use when you need exact quotes or full context.
 
 ## When to Update MEMORY.md
 
@@ -26,7 +25,7 @@ Write important facts immediately using Tools:
 
 ## Auto-consolidation
 
-Old conversations are automatically summarized to HISTORY.md and MEMORY.md. You don't manage this.
+Old conversations are automatically summarized. You don't manage this.
 
 ## Web Research
 

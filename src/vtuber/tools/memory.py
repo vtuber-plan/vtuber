@@ -166,13 +166,20 @@ def _safe_filename(key: str) -> str:
 
 @tool(
     "search_sessions",
-    "Search past conversation sessions by keyword. Returns matching messages with surrounding context.",
+    "Search past memories by keyword. Use source='summary' (default) for quick recall from consolidated history, "
+    "or source='detailed' when you need full conversation context.",
     {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
                 "description": "Search keyword or phrase",
+            },
+            "source": {
+                "type": "string",
+                "enum": ["summary", "detailed"],
+                "description": "summary = search consolidated history summaries (fast, recommended). "
+                "detailed = search raw conversation logs (slower, full context).",
             },
             "limit": {
                 "type": "integer",
@@ -184,11 +191,43 @@ def _safe_filename(key: str) -> str:
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
-    """Search through session logs for matching messages with context."""
+    """Search past memories — summaries or raw conversations."""
     query = args["query"].lower()
+    source = args.get("source", "summary")
     limit = args.get("limit", 10)
-    sessions_dir = get_sessions_dir()
 
+    if source == "summary":
+        return _search_history(query, limit)
+    return _search_sessions_detailed(query, limit)
+
+
+def _search_history(query: str, limit: int) -> dict[str, Any]:
+    """Search HISTORY.md paragraphs by keyword."""
+    from vtuber.config import get_history_path
+
+    history_path = get_history_path()
+    if not history_path.exists():
+        return {"content": [{"type": "text", "text": "No history found (HISTORY.md does not exist)."}]}
+
+    text = history_path.read_text(encoding="utf-8")
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+    results = []
+    for para in paragraphs:
+        if query in para.lower():
+            results.append(para)
+            if len(results) >= limit:
+                break
+
+    if not results:
+        return {"content": [{"type": "text", "text": f"No matches found for '{query}' in history summaries."}]}
+
+    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
+
+
+def _search_sessions_detailed(query: str, limit: int) -> dict[str, Any]:
+    """Search raw session logs for matching messages with context."""
+    sessions_dir = get_sessions_dir()
     manager = SessionManager(sessions_dir)
     results = []
 
@@ -220,7 +259,7 @@ async def search_sessions(args: dict[str, Any]) -> dict[str, Any]:
             break
 
     if not results:
-        return {"content": [{"type": "text", "text": f"No matches found for '{args['query']}'."}]}
+        return {"content": [{"type": "text", "text": f"No matches found for '{query}' in session logs."}]}
 
     return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
 
