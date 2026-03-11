@@ -32,12 +32,12 @@ class VTuberConfig(BaseModel):
         description="Agent working directory",
     )
     heartbeat_interval: int = Field(
-        default=5,
+        default=30,
         ge=1,
         description="Minutes between heartbeat checks",
     )
     cli_path: str = Field(
-        default="claude",
+        default="ripperdoc",
         description="Path to Claude CLI binary",
     )
     log_level: str = Field(
@@ -59,7 +59,7 @@ class VTuberConfig(BaseModel):
         description="Directories where the agent is allowed to write files",
     )
     max_agents: int = Field(
-        default=5,
+        default=10,
         ge=1,
         description="Maximum number of concurrent agent sessions (LRU eviction when full)",
     )
