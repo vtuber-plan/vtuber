@@ -165,40 +165,6 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
 
     return _text(f"{header}{extraction_note}{chunk}")
 
-@tool(
-    name="add_numbers",
-    description="Add two or more numbers together. Pass numbers as an array of integers or floats, e.g., {\"numbers\": [1, 2, 3]}",
-    input_schema={"numbers": list},
-)
-async def add_numbers(args: dict[str, Any]) -> dict[str, Any]:
-    """计算数字相加的工具"""
-    numbers = args.get("numbers", [])
-    if not numbers:
-        return {
-            "content": [{"type": "text", "text": "Error: No numbers provided"}],
-            "is_error": True,
-        }
-
-    # 处理可能是字符串的情况（如 "1, 2, 3"）
-    if isinstance(numbers, str):
-        try:
-            # 尝试解析逗号或空格分隔的数字
-            numbers = [float(x.strip()) for x in numbers.replace(",", " ").split()]
-        except ValueError:
-            return {
-                "content": [{"type": "text", "text": "Error: Invalid number format. Please provide an array of numbers."}],
-                "is_error": True,
-            }
-
-    try:
-        result = sum(float(n) for n in numbers)
-        return {"content": [{"type": "text", "text": f"Sum: {result}"}]}
-    except (TypeError, ValueError) as e:
-        return {
-            "content": [{"type": "text", "text": f"Error: {str(e)}"}],
-            "is_error": True,
-        }
-
 
 def _text(text: str) -> dict[str, Any]:
     """Helper to build a text content response."""

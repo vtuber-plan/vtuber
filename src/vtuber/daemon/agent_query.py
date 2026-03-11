@@ -103,7 +103,7 @@ async def iter_response(
     session_id: str = "default",
     log_source: str = "agent",
     query_timeout: float = 30.0,
-    idle_timeout: float = 120.0,
+    idle_timeout: float = 1200.0,
 ) -> AsyncIterator[AgentEvent]:
     """Query a persistent agent and yield typed events.
 

@@ -25,9 +25,9 @@ def create_tools_server(include_schedule: bool = True):
         (server, all_tool_names, web_tool_names) tuple.
     """
     from vtuber.tools.memory import search_sessions, list_sessions, read_session
-    from vtuber.tools.web import web_search, web_fetch, add_numbers
+    from vtuber.tools.web import web_search, web_fetch
 
-    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch, add_numbers]
+    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
