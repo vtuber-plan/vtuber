@@ -52,6 +52,8 @@ class OneBotProvider(Provider):
         ws_url: WebSocket URL (default: ws://127.0.0.1:6700)
         access_token: Optional access token for authentication
         owner_id: QQ user ID of the bot owner
+        bot_names: List of names the bot responds to in group chat
+        group_batch_size: Forward to agent every N messages (0 = disabled)
     """
 
     provider_type = "onebot"
@@ -66,11 +68,15 @@ class OneBotProvider(Provider):
         self.owner_id: str = str(cfg.get("owner_id", ""))
         self._user_whitelist: set[str] = {str(u) for u in cfg.get("user_whitelist", [])}
         self._group_whitelist: set[str] = {str(g) for g in cfg.get("group_whitelist", [])}
+        self._group_batch_size: int = int(cfg.get("group_batch_size", 0))
+        self._bot_names: list[str] = [str(n) for n in cfg.get("bot_names", []) if n]
+        self._stream_intermediate: bool = bool(cfg.get("stream_intermediate", False))
 
         self._ws = None  # websockets connection
         self._ws_task: asyncio.Task | None = None
         self._pending: dict[str, _PendingResponse] = {}  # session_id -> buffer
         self._group_context: dict[int, list[ChatMessage]] = {}  # group_id -> recent msgs
+        self._group_unseen: dict[int, int] = {}  # group_id -> messages since last forward
         self._self_id: int | None = None  # bot's own QQ ID (from lifecycle event)
         self._action_echo: int = 0  # echo counter for action requests
 
@@ -208,10 +214,13 @@ class OneBotProvider(Provider):
             if len(ctx) > GROUP_CONTEXT_LIMIT:
                 self._group_context[group_id] = ctx[-GROUP_CONTEXT_LIMIT:]
 
-            # Only forward to daemon if the bot is mentioned or owner speaks
+            # Track unseen message count
+            self._group_unseen[group_id] = self._group_unseen.get(group_id, 0) + 1
+
+            # Determine whether to forward to daemon
             should_forward = False
 
-            # Check if bot is @-mentioned
+            # 1. Check if bot is @-mentioned (CQ at segment)
             if isinstance(message, list):
                 for seg in message:
                     if (
@@ -222,12 +231,27 @@ class OneBotProvider(Provider):
                         should_forward = True
                         break
 
-            # Owner messages always trigger
-            if is_owner:
+            # 2. Check if bot name is mentioned in text
+            if not should_forward and self._bot_names:
+                text_lower = text.lower()
+                for name in self._bot_names:
+                    if name.lower() in text_lower:
+                        should_forward = True
+                        break
+
+            # 3. Check if accumulated messages reached batch threshold
+            if (
+                not should_forward
+                and self._group_batch_size > 0
+                and self._group_unseen[group_id] >= self._group_batch_size
+            ):
                 should_forward = True
 
             if not should_forward:
                 return
+
+            # Reset unseen counter on forward
+            self._group_unseen[group_id] = 0
 
             session_id = f"onebot:group:{group_id}"
             # Use recent context (excluding the trigger message itself)
@@ -269,7 +293,10 @@ class OneBotProvider(Provider):
                 return
 
             if content:
-                pending.chunks.append(content)
+                if self._stream_intermediate:
+                    pending.chunks.append(content)
+                else:
+                    pending.chunks = [content]
 
             if done:
                 if not no_response:

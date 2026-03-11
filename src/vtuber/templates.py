@@ -59,7 +59,7 @@ DEFAULT_CONFIG = """\
 # 修改后重启 daemon 生效: vtuber restart
 
 # 配置版本号（升级时自动迁移，请勿手动修改）
-config_version: 1
+config_version: 2
 
 # Agent 工作目录
 workspace: ~/.vtuber/workspace
@@ -87,6 +87,10 @@ allowed_write_dirs:
 #     ws_url: "ws://127.0.0.1:6700"  # OneBot 正向 WebSocket 地址
 #     access_token: ""                 # 可选，OneBot access_token
 #     owner_id: "1134505018"            # 主人的 QQ 号
+#     bot_names:                       # 机器人名字（群聊中提及时触发回复）
+#       - "小助手"
+#     group_batch_size: 0              # 每累积 N 条群消息自动触发（0 = 仅 @/提名触发）
+#     stream_intermediate: false       # 是否输出中间过程（默认只发送最终结果）
 #     user_whitelist:                  # 私聊白名单（留空则允许所有人，owner 始终放行）
 #       - "1134505018"
 #     group_whitelist:                 # 群聊白名单（留空则允许所有群）
