@@ -78,9 +78,8 @@ _SAVE_MEMORY_TOOL = [
 class HeartbeatManager:
     """Manages periodic heartbeat checks and conversation consolidation."""
 
-    def __init__(self, gateway: Gateway, session_id: str, interval_minutes: int):
+    def __init__(self, gateway: Gateway, interval_minutes: int):
         self.gateway = gateway
-        self.session_id = session_id
         self.interval = interval_minutes
         self.message_count = 0
         self._heartbeat_task: asyncio.Task | None = None
@@ -218,7 +217,7 @@ class HeartbeatManager:
             logger.error("[heartbeat] error: %s", e, exc_info=True)
 
     async def _consolidate(self):
-        """Auto-consolidate session messages into MEMORY.md + HISTORY.md via tool call."""
+        """Auto-consolidate all sessions with enough unconsolidated messages."""
         from vtuber.config import get_sessions_dir
         from vtuber.tools.memory import SessionManager
 
@@ -226,104 +225,117 @@ class HeartbeatManager:
         try:
             sessions_dir = get_sessions_dir()
             manager = SessionManager(sessions_dir)
-            session = manager.get_or_create(self.session_id)
 
-            # Check if consolidation needed
-            keep_count = 25  # Keep last 25 messages
-            if len(session.messages) <= keep_count:
-                return
-            if len(session.messages) - session.last_consolidated <= 0:
-                return
-
-            old_messages = session.messages[session.last_consolidated:-keep_count]
-            if not old_messages:
-                return
-
-            logger.info(
-                "[consolidation] starting: %d messages to consolidate",
-                len(old_messages),
-            )
-
-            # Build transcript
-            lines = []
-            for m in old_messages:
-                if not m.get("content"):
+            # Find sessions that need consolidation
+            keep_count = 25
+            for info in manager.list_sessions():
+                session_key = info.get("key")
+                if not session_key:
                     continue
-                ts = m.get("timestamp", "?")[:16]
-                role = m.get("role", "?")
-                content = m.get("content", "")
-                lines.append(f"[{ts}] {role.upper()}: {content}")
+                session = manager.get_or_create(session_key)
+                unconsolidated = len(session.messages) - session.last_consolidated
+                if len(session.messages) <= keep_count or unconsolidated <= 0:
+                    continue
 
-            if not lines:
-                return
+                old_messages = session.messages[session.last_consolidated:-keep_count]
+                if not old_messages:
+                    continue
 
-            memory_path = get_long_term_memory_path()
-            current_memory = ""
-            if memory_path.exists():
-                current_memory = memory_path.read_text(encoding="utf-8").strip()
-
-            prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
-
-## Current Long-term Memory
-{current_memory or "(empty)"}
-
-## Conversation to Process
-{chr(10).join(lines)}"""
-
-            # Call LLM with save_memory tool
-            from claude_agent_sdk import query as sdk_query
-            from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
-
-            options = build_agent_options(
-                system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
-                tools=_SAVE_MEMORY_TOOL,
-                tool_choice={"type": "tool", "name": "save_memory"},
-                include_mcp_tools=False,
-                include_preset_tools=False,
-                include_schedule=False,
-            )
-
-            tool_args = None
-            try:
-                async for msg in sdk_query(prompt=prompt, options=options):
-                    if isinstance(msg, AssistantMessage):
-                        for block in msg.content:
-                            if isinstance(block, ToolUseBlock) and block.name == "save_memory":
-                                tool_args = block.input
-                                break
-                        if tool_args:
-                            break
-            except Exception as e:
-                logger.error("[consolidation] error: %s", e, exc_info=True)
-                return
-
-            if not tool_args:
-                logger.warning("[consolidation] LLM did not call save_memory tool")
-                return
-
-            # Process results
-            from vtuber.config import get_history_path
-
-            if entry := tool_args.get("history_entry"):
-                if not isinstance(entry, str):
-                    entry = json.dumps(entry, ensure_ascii=False)
-                history_path = get_history_path()
-                with open(history_path, "a", encoding="utf-8") as f:
-                    f.write(entry.rstrip() + "\n\n")
-
-            if update := tool_args.get("memory_update"):
-                if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    memory_path.write_text(update, encoding="utf-8")
-
-            # Update session metadata
-            session.last_consolidated = len(session.messages) - keep_count
-            manager.save(session)
-
-            logger.info("[consolidation] completed: consolidated up to message %d", session.last_consolidated)
+                logger.info(
+                    "[consolidation] session %s: %d messages to consolidate",
+                    session_key, len(old_messages),
+                )
+                await self._consolidate_session(manager, session, old_messages, keep_count)
 
         except Exception as e:
             logger.error("[consolidation] error: %s", e, exc_info=True)
         finally:
             self._consolidation_running = False
+            self.message_count = 0
+
+    async def _consolidate_session(
+        self,
+        manager,
+        session,
+        old_messages: list[dict],
+        keep_count: int,
+    ):
+        """Consolidate a single session's old messages into MEMORY.md + HISTORY.md."""
+        # Build transcript
+        lines = []
+        for m in old_messages:
+            if not m.get("content"):
+                continue
+            ts = m.get("timestamp", "?")[:16]
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            lines.append(f"[{ts}] {role.upper()}: {content}")
+
+        if not lines:
+            return
+
+        memory_path = get_long_term_memory_path()
+        current_memory = ""
+        if memory_path.exists():
+            current_memory = memory_path.read_text(encoding="utf-8").strip()
+
+        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+
+## Current Long-term Memory
+{current_memory or "(empty)"}
+
+## Conversation to Process (session: {session.key})
+{chr(10).join(lines)}"""
+
+        # Call LLM with save_memory tool
+        from claude_agent_sdk import query as sdk_query
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        options = build_agent_options(
+            system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+            tools=_SAVE_MEMORY_TOOL,
+            tool_choice={"type": "tool", "name": "save_memory"},
+            include_mcp_tools=False,
+            include_preset_tools=False,
+            include_schedule=False,
+        )
+
+        tool_args = None
+        try:
+            async for msg in sdk_query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, ToolUseBlock) and block.name == "save_memory":
+                            tool_args = block.input
+                            break
+                    if tool_args:
+                        break
+        except Exception as e:
+            logger.error("[consolidation] session %s error: %s", session.key, e, exc_info=True)
+            return
+
+        if not tool_args:
+            logger.warning("[consolidation] session %s: LLM did not call save_memory tool", session.key)
+            return
+
+        # Process results
+        from vtuber.config import get_history_path
+
+        if entry := tool_args.get("history_entry"):
+            if not isinstance(entry, str):
+                entry = json.dumps(entry, ensure_ascii=False)
+            history_path = get_history_path()
+            with open(history_path, "a", encoding="utf-8") as f:
+                f.write(entry.rstrip() + "\n\n")
+
+        if update := tool_args.get("memory_update"):
+            if not isinstance(update, str):
+                update = json.dumps(update, ensure_ascii=False)
+            if update != current_memory:
+                memory_path.write_text(update, encoding="utf-8")
+
+        # Update session metadata
+        session.last_consolidated = len(session.messages) - keep_count
+        manager.save(session)
+
+        logger.info("[consolidation] session %s: consolidated up to message %d", session.key, session.last_consolidated)

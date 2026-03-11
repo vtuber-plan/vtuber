@@ -1,301 +1,272 @@
 """CLI provider - terminal-based chat with rich UI.
 
-Uses real terminal output: messages print directly to the scroll buffer,
-prompt_toolkit handles input at the bottom.  Each assistant_message is a
-complete, independent message and is rendered immediately as a Rich Panel.
+Architecture:
+- A background `_consume_queue` task continuously drains the message queue.
+- All messages render immediately above the prompt via patch_stdout.
+- The prompt stays at the bottom of the terminal at all times.
+- Status is shown in the bottom toolbar (thinking, tool use).
 """
 
 import asyncio
 import sys
+from io import StringIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.text import Text
 
-from vtuber.config import ensure_config_dir, get_config
+from vtuber.config import ensure_config_dir
 from vtuber.providers.base import QueuedProvider
 
-console = Console()
+# stderr console for banners rendered outside the prompt loop
+console = Console(stderr=True)
+
+# stdout-based console for rendering Rich objects to a string,
+# which then gets written through patch_stdout's proxy
+_render_buf = StringIO()
+_render_console = Console(file=_render_buf, force_terminal=True)
+
+
+def _print_above_prompt(renderable) -> None:
+    """Render a Rich object and write it to stdout (above the prompt via patch_stdout)."""
+    _render_buf.truncate(0)
+    _render_buf.seek(0)
+    _render_console.print(renderable)
+    text = _render_buf.getvalue()
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _render_agent(content: str) -> None:
+    _print_above_prompt(Panel(
+        Markdown(content.strip()),
+        title="[bold cyan]Agent[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+
+
+def _render_task(content: str) -> None:
+    _print_above_prompt(Panel(
+        Markdown(content.strip()),
+        title="[bold yellow]Task[/bold yellow]",
+        border_style="yellow",
+        padding=(1, 2),
+    ))
+
+
+def _render_heartbeat(content: str) -> None:
+    _print_above_prompt(Panel(
+        Markdown(content.strip()),
+        title="[bold cyan]Heartbeat[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+
+
+# ── CLI Provider ──────────────────────────────────────────────────
 
 
 class CLIProvider(QueuedProvider):
     """Terminal-based provider using prompt_toolkit + rich.
 
-    Messages print directly to the real terminal scroll buffer.
-    Each assistant_message is a complete, independent message —
-    displayed immediately upon arrival.  The ``done`` flag only
-    signals that the agent query has finished.
+    The prompt stays at the bottom at all times. Messages render above it
+    in real time via patch_stdout.
     """
 
     provider_type = "cli"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._prompting = False
-        self._task_buffer = ""
+        # CLI owner always gets a stable provider_id so the session_id
+        # (dm:cli:owner) is deterministic across restarts.
+        self.provider_id = "cli"
 
         history_path = ensure_config_dir() / "cli_history"
-        self.session = PromptSession(history=FileHistory(str(history_path)))
-
-    # ── Callback overrides for INPUT phase ────────────────────────
-    # These fire when the user is at the prompt (self._prompting is True)
-    # and a background message (heartbeat/task) arrives.
-
-    async def on_task(self, content: str, task: str, *, done: bool) -> None:
-        if self._prompting:
-            if content:
-                self._task_buffer += content
-            if done:
-                if self._task_buffer.strip():
-                    console.print()
-                    console.print(Panel(
-                        Markdown(self._task_buffer.strip()),
-                        title="[bold yellow]Task[/bold yellow]",
-                        border_style="yellow",
-                        padding=(1, 2),
-                    ))
-                self._task_buffer = ""
-        else:
-            await self._msg_queue.put({
-                "type": "task_message",
-                "content": content,
-                "task": task,
-                "done": done,
-            })
-
-    async def on_heartbeat(self, content: str) -> None:
-        if self._prompting:
-            if content.strip():
-                console.print()
-                console.print(Panel(
-                    Markdown(content.strip()),
-                    title="[bold cyan]Heartbeat[/bold cyan]",
-                    border_style="cyan",
-                    padding=(1, 2),
-                ))
-        else:
-            await self._msg_queue.put({
-                "type": "heartbeat_message",
-                "content": content,
-            })
-
-    async def on_disconnected(self) -> None:
-        console.print("\n[yellow]Daemon 连接已关闭[/yellow]")
-
-    # ── Spinner helpers ───────────────────────────────────────────
-
-    @staticmethod
-    def _make_spinner(text: str = "思考中...") -> Live:
-        return Live(
-            Spinner("dots", text=Text(f" {text}", style="dim")),
-            console=console,
-            transient=True,
-            refresh_per_second=12,
+        self.session = PromptSession(
+            history=FileHistory(str(history_path)),
+            bottom_toolbar=self._get_toolbar,
         )
 
-    # ── Response handling ─────────────────────────────────────────
+        # Status for toolbar
+        self._status: str = ""
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spinner_idx = 0
+        self._spinner_task: asyncio.Task | None = None
 
-    async def _drain_pending(self) -> None:
-        """Display any messages that arrived while the user was typing."""
-        while not self._msg_queue.empty():
+        # Task buffering (tasks arrive in chunks, render when done)
+        self._tasks: dict[str, str] = {}
+
+        # Background consumer
+        self._consumer_task: asyncio.Task | None = None
+
+    # ── Toolbar ──────────────────────────────────────────────────
+
+    def _get_toolbar(self):
+        if self._status:
+            frame = self._spinner_frames[self._spinner_idx % len(self._spinner_frames)]
+            return HTML(
+                f'<style fg="ansibrightcyan"> {frame} {self._status}</style>'
+            )
+        return HTML(
+            '<style fg="ansigray"> Alt+Enter 换行，Enter 发送</style>'
+        )
+
+    def _invalidate(self) -> None:
+        """Refresh the prompt UI (e.g., to update toolbar)."""
+        app = self.session.app
+        if app is not None:
+            app.invalidate()
+
+    async def _animate_spinner(self) -> None:
+        """Tick the spinner frame and refresh toolbar periodically."""
+        try:
+            while True:
+                await asyncio.sleep(0.08)
+                if self._status:
+                    self._spinner_idx += 1
+                    self._invalidate()
+        except asyncio.CancelledError:
+            pass
+
+    def _set_status(self, text: str) -> None:
+        """Update status and start/stop spinner animation as needed."""
+        was_active = bool(self._status)
+        self._status = text
+        self._invalidate()
+
+        if text and not was_active:
+            # Start spinner animation
+            self._spinner_idx = 0
+            self._spinner_task = asyncio.ensure_future(self._animate_spinner())
+        elif not text and was_active and self._spinner_task:
+            # Stop spinner animation
+            self._spinner_task.cancel()
+            self._spinner_task = None
+
+    # ── Callback overrides ────────────────────────────────────────
+
+    async def on_task(self, content: str, task: str, *, done: bool) -> None:
+        await self._msg_queue.put({
+            "type": "task_message",
+            "content": content,
+            "task": task,
+            "done": done,
+        })
+
+    async def on_heartbeat(self, content: str) -> None:
+        await self._msg_queue.put({
+            "type": "heartbeat_message",
+            "content": content,
+        })
+
+    async def on_disconnected(self) -> None:
+        _print_above_prompt("[yellow]Daemon 连接已关闭[/yellow]")
+
+    # ── Background consumer ───────────────────────────────────────
+
+    async def _consume_queue(self) -> None:
+        """Continuously consume and render messages from the queue."""
+        while self.running:
             try:
-                msg = self._msg_queue.get_nowait()
-            except asyncio.QueueEmpty:
+                msg = await asyncio.wait_for(self._msg_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
                 break
 
             msg_type = msg.get("type")
             content = msg.get("content", "")
 
-            if msg_type == "assistant_message" and content.strip():
-                console.print(Panel(
-                    Markdown(content.strip()),
-                    title="[bold cyan]Agent[/bold cyan]",
-                    border_style="cyan",
-                    padding=(1, 2),
-                ))
-            elif msg_type == "heartbeat_message" and content.strip():
-                console.print(Panel(
-                    Markdown(content.strip()),
-                    title="[bold cyan]Heartbeat[/bold cyan]",
-                    border_style="cyan",
-                    padding=(1, 2),
-                ))
-            elif msg_type == "task_message" and content.strip():
-                console.print(Panel(
-                    Markdown(content.strip()),
-                    title="[bold yellow]Task[/bold yellow]",
-                    border_style="yellow",
-                    padding=(1, 2),
-                ))
-            elif msg_type == "error" and content:
-                console.print(f"[bold red]{content}[/bold red]")
+            if msg_type == "assistant_message":
+                if content.strip():
+                    _render_agent(content)
+                if msg.get("done"):
+                    self._set_status("")
 
-    async def _wait_for_response(self) -> None:
-        """Wait for agent response. Each assistant_message is displayed immediately.
+            elif msg_type == "progress":
+                tool = msg.get("tool", "")
+                self._set_status(f"⚙ {tool}" if tool else "思考中...")
 
-        The ``done`` flag only signals that the agent has finished — it does
-        NOT mean "end of a streaming chunk".  Every assistant_message with
-        content is a complete, independent message and is rendered right away.
-        """
-        task_bufs: dict[str, str] = {}
-        spinner: Live | None = None
+            elif msg_type == "task_message":
+                task_name = msg.get("task", "task")
+                if content:
+                    self._tasks.setdefault(task_name, "")
+                    self._tasks[task_name] += content
+                if msg.get("done") and self._tasks.get(task_name, "").strip():
+                    _render_task(self._tasks.pop(task_name))
 
-        def start_spinner(text: str = "思考中..."):
-            nonlocal spinner
-            if spinner is None:
-                spinner = self._make_spinner(text)
-                spinner.start()
-            else:
-                spinner.update(Spinner("dots", text=Text(f" {text}", style="dim")))
+            elif msg_type == "heartbeat_message":
+                if content.strip():
+                    _render_heartbeat(content)
 
-        def stop_spinner():
-            nonlocal spinner
-            if spinner:
-                spinner.stop()
-                spinner = None
+            elif msg_type == "error":
+                if content:
+                    _print_above_prompt(f"[bold red]{content}[/bold red]")
+                self._set_status("")
 
-        start_spinner()
-
-        try:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(
-                        self._msg_queue.get(),
-                        timeout=get_config().response_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    stop_spinner()
-                    console.print("[yellow]响应超时[/yellow]")
-                    return
-
-                msg_type = msg.get("type")
-
-                # ── Assistant message: display immediately ────────
-                if msg_type == "assistant_message":
-                    content = msg.get("content", "")
-                    if content.strip():
-                        stop_spinner()
-                        console.print(Panel(
-                            Markdown(content.strip()),
-                            title="[bold cyan]Agent[/bold cyan]",
-                            border_style="cyan",
-                            padding=(1, 2),
-                        ))
-                    if msg.get("done"):
-                        break
-                    start_spinner()
-
-                # ── Tool progress ─────────────────────────────────
-                elif msg_type == "progress":
-                    tool = msg.get("tool", "")
-                    start_spinner(f"⚙ {tool}")
-
-                # ── Task message: buffer by task name ──────────
-                elif msg_type == "task_message":
-                    content = msg.get("content", "")
-                    task_name = msg.get("task", "task")
-                    if content:
-                        task_bufs.setdefault(task_name, "")
-                        task_bufs[task_name] += content
-                    if msg.get("done") and task_bufs.get(task_name, "").strip():
-                        stop_spinner()
-                        console.print(Panel(
-                            Markdown(task_bufs.pop(task_name).strip()),
-                            title="[bold yellow]Task[/bold yellow]",
-                            border_style="yellow",
-                            padding=(1, 2),
-                        ))
-                        start_spinner()
-
-                # ── Heartbeat: display immediately ────────────────
-                elif msg_type == "heartbeat_message":
-                    content = msg.get("content", "")
-                    if content.strip():
-                        stop_spinner()
-                        console.print(Panel(
-                            Markdown(content.strip()),
-                            title="[bold cyan]Heartbeat[/bold cyan]",
-                            border_style="cyan",
-                            padding=(1, 2),
-                        ))
-                        start_spinner()
-
-                # ── Error: display and abort ──────────────────────
-                elif msg_type == "error":
-                    stop_spinner()
-                    console.print(f"[bold red]{msg.get('content', '')}[/bold red]")
-                    return
-
-                elif msg_type == "pong":
-                    continue
-
-        finally:
-            stop_spinner()
-
-    # ── Main loop ────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Run the interactive CLI — real terminal output, prompt at bottom."""
+        """Run the interactive CLI."""
         if not await self.connect():
-            console.print(
-                Panel(
-                    "[red]Daemon 未运行[/red]\n\n"
-                    "请先启动 daemon：[bold]vtuber start[/bold]",
-                    title="连接失败",
-                    border_style="red",
-                )
-            )
+            console.print(Panel(
+                "[red]Daemon 未运行[/red]\n\n"
+                "请先启动 daemon：[bold]vtuber start[/bold]",
+                title="连接失败",
+                border_style="red",
+            ))
             return
 
         console.print()
-        console.print(
-            Panel(
-                "[green]已连接到 VTuber daemon[/green]\n"
-                "输入消息并回车发送，输入 [bold]/quit[/bold] 退出",
-                title="VTuber Chat",
-                border_style="green",
-            )
-        )
+        console.print(Panel(
+            "[green]已连接到 VTuber[/green]\n"
+            "输入消息并回车发送，输入 [bold]/quit[/bold] 退出",
+            title="VTuber Chat",
+            border_style="green",
+        ))
         console.print()
 
-        try:
-            while self.running:
-                await self._drain_pending()
+        # Start background consumer
+        self._consumer_task = asyncio.create_task(self._consume_queue())
 
-                try:
-                    self._prompting = True
-                    with patch_stdout():
+        try:
+            with patch_stdout(raw=True):
+                while self.running:
+                    try:
                         user_input = await self.session.prompt_async(
                             HTML(
                                 "<ansigreen><b>You</b></ansigreen>"
                                 "<ansigray> › </ansigray>"
                             ),
                         )
-                    self._prompting = False
 
-                    if user_input.strip().lower() in ("/quit", "/exit"):
-                        break
+                        if user_input.strip().lower() in ("/quit", "/exit"):
+                            break
 
-                    if user_input.strip():
+                        if not user_input.strip():
+                            continue
+
+                        self._set_status("思考中...")
                         await self.send_message(user_input)
-                        await self._wait_for_response()
-                        console.print()  # blank line before next prompt
 
-                except EOFError:
-                    break
-                except KeyboardInterrupt:
-                    self._prompting = False
-                    continue
+                    except EOFError:
+                        break
+                    except KeyboardInterrupt:
+                        continue
 
         finally:
-            self._prompting = False
+            self._set_status("")
+            if self._consumer_task:
+                self._consumer_task.cancel()
+                try:
+                    await self._consumer_task
+                except asyncio.CancelledError:
+                    pass
             await self.disconnect()
             console.print("\n[dim]已断开连接[/dim]")
 

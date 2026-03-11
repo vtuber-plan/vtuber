@@ -86,6 +86,7 @@ class Provider(ABC):
         is_owner: bool = True,
         is_private: bool = True,
         channel_id: str | None = None,
+        session_id: str | None = None,
         context: list[ChatMessage] | None = None,
     ) -> None:
         """Send a user message to the daemon.
@@ -96,6 +97,11 @@ class Provider(ABC):
             is_owner: Whether the sender is the agent's primary user.
             is_private: True for DM/CLI, False for group chats.
             channel_id: Unique channel identifier for group chats.
+            session_id: Explicit session identifier. If provided, overrides
+                the default session routing. Providers should use this to
+                isolate conversations — e.g. per-user DMs or per-channel
+                group chats. If omitted, the daemon derives a session_id
+                from provider_id + sender (private) or channel_id (group).
             context: Recent conversation context (for group chats).
         """
         msg: dict = {
@@ -107,6 +113,8 @@ class Provider(ABC):
         }
         if channel_id is not None:
             msg["channel_id"] = channel_id
+        if session_id is not None:
+            msg["session_id"] = session_id
         if context:
             msg["context"] = [
                 {"sender": m.sender, "content": m.content} for m in context

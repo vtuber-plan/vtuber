@@ -100,6 +100,7 @@ async def iter_response(
     agent: ClaudeSDKClient,
     query: str,
     *,
+    session_id: str = "default",
     log_source: str = "agent",
     query_timeout: float = 30.0,
     idle_timeout: float = 120.0,
@@ -116,7 +117,7 @@ async def iter_response(
         AgentTimeoutError: If agent.query() or receive_response() times out.
     """
     try:
-        await asyncio.wait_for(agent.query(query), timeout=query_timeout)
+        await asyncio.wait_for(agent.query(query, session_id=session_id), timeout=query_timeout)
     except asyncio.TimeoutError:
         raise AgentTimeoutError(
             f"agent.query() timed out after {query_timeout:.0f}s"
@@ -124,51 +125,78 @@ async def iter_response(
 
     logger.debug("[%s] query accepted, awaiting response stream", log_source)
 
-    # Use asyncio.wait (NOT wait_for) so we don't cancel the __anext__ task.
-    # Cancelling __anext__() on the SDK's async generator triggers
-    # "RuntimeError: aclose(): asynchronous generator is already running".
-    # On timeout the orphaned task will die when the caller kills the subprocess.
+    # Use asyncio.wait (NOT wait_for) so we don't cancel the __anext__ task
+    # while the SDK's async generator is running.  On timeout we cancel
+    # the task explicitly and close the generator before raising.
     aiter = agent.receive_response().__aiter__()
-    while True:
-        task = asyncio.create_task(_safe_anext(aiter))
-        done, _ = await asyncio.wait({task}, timeout=idle_timeout)
-        if not done:
-            raise AgentTimeoutError(
-                f"receive_response() idle for {idle_timeout:.0f}s"
-            )
+    pending_task: asyncio.Task | None = None
+    try:
+        while True:
+            pending_task = asyncio.create_task(_safe_anext(aiter))
+            done, _ = await asyncio.wait({pending_task}, timeout=idle_timeout)
+            if not done:
+                # Timeout — cancel the pending __anext__ task before raising
+                pending_task.cancel()
+                try:
+                    await pending_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                pending_task = None
+                raise AgentTimeoutError(
+                    f"receive_response() idle for {idle_timeout:.0f}s"
+                )
 
-        result = task.result()
-        if result is _SENTINEL:
-            break
+            pending_task = None
+            result = done.pop().result()
+            if result is _SENTINEL:
+                break
 
-        msg = result
-        log_stream_event(msg, log_source)
+            msg = result
+            log_stream_event(msg, log_source)
 
-        tool_name = extract_tool_use_start(msg)
-        if tool_name:
-            yield AgentEvent(type="tool", tool=tool_name)
-            continue
+            # Skip sub-agent messages — only surface top-level agent output.
+            if getattr(msg, "parent_tool_use_id", None):
+                continue
 
-        # Only process AssistantMessage, skip StreamEvent deltas
-        if isinstance(msg, StreamEvent):
-            continue
+            tool_name = extract_tool_use_start(msg)
+            if tool_name:
+                yield AgentEvent(type="tool", tool=tool_name)
+                continue
 
-        text = extract_stream_text(msg)
-        if text:
-            yield AgentEvent(type="text", text=text)
-        elif isinstance(msg, ResultMessage):
-            yield AgentEvent(type="result")
+            # Only process AssistantMessage, skip StreamEvent deltas
+            if isinstance(msg, StreamEvent):
+                continue
+
+            text = extract_stream_text(msg)
+            if text:
+                yield AgentEvent(type="text", text=text)
+            elif isinstance(msg, ResultMessage):
+                yield AgentEvent(type="result")
+    finally:
+        # Cancel any in-flight task before closing the generator
+        if pending_task and not pending_task.done():
+            pending_task.cancel()
+            try:
+                await pending_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Safely close the async generator
+        try:
+            await aiter.aclose()
+        except Exception:
+            pass
 
 
 async def collect_response(
     agent: ClaudeSDKClient,
     query: str,
     *,
+    session_id: str = "default",
     log_source: str = "agent",
 ) -> str:
     """Query a persistent agent and return the full collected text response."""
     collected = ""
-    async for event in iter_response(agent, query, log_source=log_source):
+    async for event in iter_response(agent, query, session_id=session_id, log_source=log_source):
         if event.type == "text":
             collected += event.text
     return collected
@@ -190,6 +218,10 @@ async def iter_oneshot(
     """
     async for msg in sdk_query(prompt=prompt, options=options):
         log_stream_event(msg, log_source)
+
+        # Skip sub-agent messages — only surface top-level agent output.
+        if getattr(msg, "parent_tool_use_id", None):
+            continue
 
         tool_name = extract_tool_use_start(msg)
         if tool_name:

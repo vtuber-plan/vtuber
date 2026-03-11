@@ -20,8 +20,20 @@ from claude_agent_sdk import (
 
 @tool(
     name="add_numbers",
-    description="Add two or more numbers together. Pass numbers as an array of integers or floats, e.g., {\"numbers\": [1, 2, 3]}",
-    input_schema={"numbers": list},
+    description="Add two or more numbers together. Pass numbers as an array of integers or floats.",
+    input_schema={
+    "type": "object",
+    "properties": {
+        "numbers": {
+            "type": "array",
+            "items": {
+                "type": "number"
+            },
+            "description": "List of numbers"
+        }
+    },
+    "required": ["numbers"]
+}
 )
 async def add_numbers(args: dict[str, Any]) -> dict[str, Any]:
     """计算数字相加的工具"""

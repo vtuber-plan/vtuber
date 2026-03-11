@@ -38,7 +38,7 @@ class ProviderConnection:
         try:
             self.writer.close()
             await self.writer.wait_closed()
-        except Exception:
+        except BaseException:  # noqa: BLE001 — absorb CancelledError, ConnectionError, etc.
             pass
 
     @property

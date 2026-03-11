@@ -1,6 +1,7 @@
 """Schedule tools using APScheduler for precise task execution."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from claude_agent_sdk import tool
@@ -23,20 +24,29 @@ def set_task_queue(queue: asyncio.Queue):
     _task_queue = queue
 
 
-async def scheduled_job_handler(task: str = ""):
+async def scheduled_job_handler(task: str = "", deliver: bool = True):
     """Async handler called by APScheduler when a scheduled job fires.
 
     This is a named, importable function (not a lambda) so that APScheduler
-    can serialize it to the SQLAlchemy job store. It puts the task prompt
+    can serialize it to the SQLAlchemy job store. It puts the task payload
     into an asyncio.Queue that the daemon consumes.
     """
     if _task_queue and task:
-        await _task_queue.put(task)
+        await _task_queue.put({"task": task, "deliver": deliver})
+
+
+def _text(text: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}]}
+
+
+def _error(text: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": f"Error: {text}"}], "is_error": True}
 
 
 @tool(
     "schedule_create",
-    "Create a scheduled task for the agent to execute at a specific time or interval.",
+    "Create a scheduled task. Provide exactly ONE of: offset_seconds (one-time after delay), "
+    "at (one-time at datetime), every_seconds (recurring interval), or cron (cron expression).",
     {
         "type": "object",
         "properties": {
@@ -46,116 +56,150 @@ async def scheduled_job_handler(task: str = ""):
             },
             "task": {
                 "type": "string",
-                "description": "Description of the task for the agent to execute",
+                "description": "Description of the task for the agent to execute when triggered",
             },
-            "trigger_type": {
+            "offset_seconds": {
+                "type": "integer",
+                "description": "Run once after this many seconds from now",
+            },
+            "at": {
                 "type": "string",
-                "enum": ["date", "interval", "cron"],
-                "description": (
-                    "Type of trigger: "
-                    "'date' (one-time at specific datetime), "
-                    "'interval' (recurring every N hours/minutes), "
-                    "'cron' (cron-style recurring)"
-                ),
+                "description": "Run once at this ISO datetime (e.g. '2026-07-22T09:00:00')",
             },
-            "trigger_config": {
-                "type": "object",
-                "description": (
-                    "Trigger parameters passed to APScheduler. Examples:\n"
-                    "- date: {\"run_date\": \"2026-07-22 09:00:00\"}\n"
-                    "- interval: {\"hours\": 1} or {\"minutes\": 30}\n"
-                    "- cron: {\"hour\": 8, \"minute\": 0} for daily at 8am\n"
-                    "- cron: {\"day_of_week\": \"mon-fri\", \"hour\": 9} for weekdays at 9am\n"
-                    "Timezone: add \"timezone\": \"Asia/Shanghai\" to any trigger_config "
-                    "for timezone-aware scheduling (IANA timezone names)."
-                ),
+            "every_seconds": {
+                "type": "integer",
+                "description": "Run repeatedly every N seconds",
+            },
+            "cron": {
+                "type": "string",
+                "description": "Cron expression for recurring schedule (e.g. '0 9 * * *' for daily 9am)",
+            },
+            "tz": {
+                "type": "string",
+                "description": "IANA timezone (e.g. 'Asia/Shanghai'). Applies to cron and at.",
+            },
+            "deliver": {
+                "type": "boolean",
+                "description": "Whether to deliver the agent's response to the user (default true). Set false for silent background tasks.",
             },
         },
-        "required": ["task_id", "task", "trigger_type", "trigger_config"],
+        "required": ["task_id", "task"],
     },
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
 )
 async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
     """Create a scheduled task."""
     if _scheduler is None:
-        return {
-            "content": [
-                {"type": "text", "text": "Error: Scheduler not initialized. Daemon must be running."}
-            ]
-        }
+        return _error("Scheduler not initialized. Daemon must be running.")
 
     task_id = args["task_id"]
     task_prompt = args["task"]
-    trigger_type = args["trigger_type"]
-    trigger_config = args.get("trigger_config", {})
+    deliver = args.get("deliver", True)
+    tz_name = args.get("tz")
+
+    offset = args.get("offset_seconds")
+    at = args.get("at")
+    every = args.get("every_seconds")
+    cron_expr = args.get("cron")
+
+    # Exactly one scheduling mode must be provided
+    modes = sum(x is not None for x in (offset, at, every, cron_expr))
+    if modes != 1:
+        return _error("Provide exactly one of: offset_seconds, at, every_seconds, cron")
+
+    job_kwargs = {"task": task_prompt, "deliver": deliver}
 
     try:
-        _scheduler.scheduler.add_job(
-            func=scheduled_job_handler,
-            trigger=trigger_type,
-            id=task_id,
-            kwargs={"task": task_prompt},
-            replace_existing=True,
-            **trigger_config,
-        )
+        if offset is not None:
+            run_date = datetime.now(timezone.utc) + timedelta(seconds=int(offset))
+            _scheduler.scheduler.add_job(
+                func=scheduled_job_handler,
+                trigger="date",
+                id=task_id,
+                kwargs=job_kwargs,
+                replace_existing=True,
+                run_date=run_date,
+            )
+        elif at is not None:
+            run_date = datetime.fromisoformat(at)
+            kwargs: dict[str, Any] = {"run_date": run_date}
+            if tz_name:
+                kwargs["timezone"] = tz_name
+            _scheduler.scheduler.add_job(
+                func=scheduled_job_handler,
+                trigger="date",
+                id=task_id,
+                kwargs=job_kwargs,
+                replace_existing=True,
+                **kwargs,
+            )
+        elif every is not None:
+            _scheduler.scheduler.add_job(
+                func=scheduled_job_handler,
+                trigger="interval",
+                id=task_id,
+                kwargs=job_kwargs,
+                replace_existing=True,
+                seconds=int(every),
+            )
+        elif cron_expr is not None:
+            from apscheduler.triggers.cron import CronTrigger
 
-        # Read back the job to confirm next run time
+            trigger_kwargs: dict[str, Any] = {}
+            if tz_name:
+                trigger_kwargs["timezone"] = tz_name
+            trigger = CronTrigger.from_crontab(cron_expr, **trigger_kwargs)
+            _scheduler.scheduler.add_job(
+                func=scheduled_job_handler,
+                trigger=trigger,
+                id=task_id,
+                kwargs=job_kwargs,
+                replace_existing=True,
+            )
+
+        # Read back job to confirm
         job = _scheduler.scheduler.get_job(task_id)
         next_run = (
-            job.next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+            job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
             if job and job.next_run_time
             else "pending"
         )
+        return _text(f"Scheduled '{task_id}': {task_prompt} (next run: {next_run})")
 
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Created scheduled task '{task_id}': {task_prompt} (next run: {next_run})",
-                }
-            ]
-        }
     except Exception as e:
-        return {
-            "content": [{"type": "text", "text": f"Error creating task: {str(e)}"}]
-        }
+        return _error(f"Failed to create task: {e}")
 
 
 @tool(
     "schedule_list",
-    "List all scheduled tasks",
+    "List all scheduled tasks with their next run times.",
     {
         "type": "object",
         "properties": {},
-        "required": [],
     },
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
     """List all scheduled tasks."""
     if _scheduler is None:
-        return {
-            "content": [
-                {"type": "text", "text": "Error: Scheduler not initialized. Daemon must be running."}
-            ]
-        }
+        return _error("Scheduler not initialized. Daemon must be running.")
 
     jobs = _scheduler.scheduler.get_jobs()
     if not jobs:
-        return {"content": [{"type": "text", "text": "No scheduled tasks."}]}
+        return _text("No scheduled tasks.")
 
     lines = ["Scheduled tasks:"]
     for job in jobs:
-        next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "N/A"
+        next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z") if job.next_run_time else "N/A"
         task_desc = job.kwargs.get("task", "N/A") if job.kwargs else "N/A"
         lines.append(f"- {job.id}: {task_desc} (next: {next_run})")
 
-    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+    return _text("\n".join(lines))
 
 
 @tool(
     "schedule_cancel",
-    "Cancel a scheduled task",
+    "Cancel a scheduled task by its ID.",
     {
         "type": "object",
         "properties": {
@@ -168,17 +212,11 @@ async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
 async def schedule_cancel(args: dict[str, Any]) -> dict[str, Any]:
     """Cancel a scheduled task."""
     if _scheduler is None:
-        return {
-            "content": [
-                {"type": "text", "text": "Error: Scheduler not initialized. Daemon must be running."}
-            ]
-        }
+        return _error("Scheduler not initialized. Daemon must be running.")
 
     task_id = args["task_id"]
     try:
         _scheduler.scheduler.remove_job(task_id)
-        return {"content": [{"type": "text", "text": f"Cancelled task '{task_id}'"}]}
+        return _text(f"Cancelled task '{task_id}'")
     except Exception:
-        return {
-            "content": [{"type": "text", "text": f"Task '{task_id}' not found or already completed"}]
-        }
+        return _error(f"Task '{task_id}' not found or already completed")

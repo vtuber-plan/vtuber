@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+from collections import OrderedDict
 
 from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
-from claude_agent_sdk.types import ClaudeAgentOptions
+from claude_agent_sdk.types import AgentDefinition, ClaudeAgentOptions
 
 from vtuber.config import ensure_workspace_dir, get_config, get_persona_path, get_user_path, get_plugins_dir
 from vtuber.permissions import agent_permission_handler
@@ -12,27 +13,30 @@ from vtuber.persona import build_system_prompt
 
 logger = logging.getLogger("vtuber.daemon")
 
+_SERVER_NAME = "vtuber"
+# Tools that should only be used by the web-researcher sub-agent, not the main agent.
+_WEB_ONLY_TOOLS = {"web_search", "web_fetch"}
+
 
 def create_tools_server(include_schedule: bool = True):
     """Create an SDK MCP server with vtuber tools.
 
     Returns:
-        (server, allowed_tool_names) tuple.
+        (server, all_tool_names, web_tool_names) tuple.
     """
-    SERVER_NAME = "vtuber"
-
     from vtuber.tools.memory import search_sessions, list_sessions, read_session
-    from vtuber.tools.web import web_search, web_fetch
+    from vtuber.tools.web import web_search, web_fetch, add_numbers
 
-    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch]
+    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch, add_numbers]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
         tools.extend([schedule_create, schedule_list, schedule_cancel])
 
-    allowed = [f"mcp__{SERVER_NAME}__{i.name}" for i in tools]
-    server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
-    return server, allowed
+    all_names = [f"mcp__{_SERVER_NAME}__{i.name}" for i in tools]
+    web_names = [f"mcp__{_SERVER_NAME}__{i.name}" for i in tools if i.name in _WEB_ONLY_TOOLS]
+    server = create_sdk_mcp_server(_SERVER_NAME, tools=tools)
+    return server, all_names, web_names
 
 
 def build_agent_options(
@@ -72,15 +76,15 @@ def build_agent_options(
     }
 
     # Load plugins from ~/.vtuber/plugins/
-    # plugins_dir = get_plugins_dir()
-    # if plugins_dir.is_dir():
-    #     plugin_configs = [
-    #         {"type": "local", "path": str(p)}
-    #         for p in sorted(plugins_dir.iterdir())
-    #         if p.is_dir() and not p.name.startswith(("_", "."))
-    #     ]
-    #     if plugin_configs:
-    #         options_kwargs["plugins"] = plugin_configs
+    plugins_dir = get_plugins_dir()
+    if plugins_dir.is_dir():
+        plugin_configs = [
+            {"type": "local", "path": str(p)}
+            for p in sorted(plugins_dir.iterdir())
+            if p.is_dir() and not p.name.startswith(("_", "."))
+        ]
+        if plugin_configs:
+            options_kwargs["plugins"] = plugin_configs
 
     if include_preset_system_prompt:
         options_kwargs['system_prompt'] = {
@@ -90,11 +94,28 @@ def build_agent_options(
         }
 
     if include_mcp_tools:
-        tools_server, allowed_tools = create_tools_server(
+        tools_server, all_tool_names, web_tool_names = create_tools_server(
             include_schedule=include_schedule,
         )
-        options_kwargs["mcp_servers"] = {"vtuber_tools": tools_server}
-        options_kwargs["allowed_tools"] = allowed_tools
+        options_kwargs["mcp_servers"] = {"vtuber": tools_server}
+        # Main agent cannot use web tools directly — delegate via web-researcher sub-agent.
+        options_kwargs["allowed_tools"] = [t for t in all_tool_names if t not in web_tool_names]
+        options_kwargs["agents"] = {
+            "web-researcher": AgentDefinition(
+                description=(
+                    "Use this agent for ANY task that requires web searching or fetching web pages. "
+                    "This agent has access to web_search and web_fetch tools and will return concise, summarized results. "
+                    "Always delegate web research to this agent instead of calling web tools directly."
+                ),
+                prompt=(
+                    "You are a web research assistant. "
+                    "Use the web_search and web_fetch tools to find information as requested. "
+                    "After gathering results, provide a concise summary focusing only on the most relevant information. "
+                    "Keep your response brief and focused. Do not include unnecessary preamble."
+                ),
+                tools=web_tool_names,
+            ),
+        }
 
     if include_preset_tools:
         options_kwargs["tools"] = {"type": "preset", "preset": "claude_code"}
@@ -146,60 +167,61 @@ async def safe_disconnect(agent: ClaudeSDKClient, timeout: float = 5.0) -> None:
         pass
 
 
-class GroupAgentManager:
-    """Manages per-channel persistent agents for group chats."""
+class AgentPool:
+    """Manages a pool of ClaudeSDKClient instances, one per session_id.
 
-    def __init__(self):
-        self._agents: dict[str, ClaudeSDKClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._create_lock = asyncio.Lock()
+    Agents are lazily created on first access and evicted LRU when the pool
+    reaches ``max_agents``.
+    """
 
-    async def get_or_create(self, channel_id: str) -> ClaudeSDKClient:
-        """Get an existing agent for a channel, or create a new one (thread-safe)."""
-        if channel_id in self._agents:
-            return self._agents[channel_id]
+    def __init__(self, max_agents: int = 5, **create_kwargs):
+        self._agents: OrderedDict[str, ClaudeSDKClient] = OrderedDict()
+        self._max = max_agents
+        self._create_kwargs = create_kwargs
 
-        async with self._create_lock:
-            # Double-check after acquiring lock
-            if channel_id in self._agents:
-                return self._agents[channel_id]
+    async def get(self, session_id: str) -> ClaudeSDKClient:
+        """Get or create an agent for *session_id*.  LRU eviction when full."""
+        if session_id in self._agents:
+            self._agents.move_to_end(session_id)
+            return self._agents[session_id]
 
-            agent = await create_agent(
-                prompt_suffix=(
-                    f"你正在参与一个群聊（频道: {channel_id}）。\n"
-                    "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
-                    "如果对话不需要你参与，请只回复: NO_RESPONSE\n"
-                    "如果需要回复，直接回复内容即可，不要加任何前缀。"
-                ),
-            )
-            self._agents[channel_id] = agent
-            self._locks[channel_id] = asyncio.Lock()
-            logger.info("[group/%s] created persistent agent", channel_id)
-            return agent
+        # Evict oldest if at capacity
+        if len(self._agents) >= self._max:
+            oldest_id, oldest_agent = self._agents.popitem(last=False)
+            await safe_disconnect(oldest_agent)
+            logger.info("Evicted agent for session %s", oldest_id)
 
-    def get_lock(self, channel_id: str) -> asyncio.Lock:
-        """Get the concurrency lock for a channel's agent."""
-        if channel_id not in self._locks:
-            self._locks[channel_id] = asyncio.Lock()
-        return self._locks[channel_id]
+        agent = await create_agent(**self._create_kwargs)
+        self._agents[session_id] = agent
+        logger.info(
+            "Created agent for session %s (pool=%d/%d)",
+            session_id, len(self._agents), self._max,
+        )
+        return agent
 
-    async def recover(self, channel_id: str) -> None:
-        """Kill and recreate the agent for a channel."""
+    async def remove(self, session_id: str) -> None:
+        """Remove and disconnect a specific agent."""
+        if agent := self._agents.pop(session_id, None):
+            await safe_disconnect(agent)
+
+    async def close_all(self) -> None:
+        """Disconnect all agents gracefully."""
+        for agent in self._agents.values():
+            await safe_disconnect(agent)
+        self._agents.clear()
+
+    async def kill_and_recreate(self, session_id: str) -> ClaudeSDKClient:
+        """Kill a hung agent and create a fresh one for the session."""
         from vtuber.daemon.agent_query import kill_agent_process
 
-        old = self._agents.pop(channel_id, None)
-        if old:
-            kill_agent_process(old)
-            await safe_disconnect(old)
-            logger.warning("[group/%s] agent recovered", channel_id)
+        if agent := self._agents.pop(session_id, None):
+            kill_agent_process(agent)
+        return await self.get(session_id)
 
-    async def close_all(self):
-        """Disconnect all group agents."""
-        for channel_id, agent in self._agents.items():
-            try:
-                await agent.disconnect()
-                logger.info("[group/%s] agent disconnected", channel_id)
-            except Exception:
-                pass
+    def kill_all_and_clear(self) -> None:
+        """Kill all agent subprocesses immediately (for reload/recovery)."""
+        from vtuber.daemon.agent_query import kill_agent_process
+
+        for agent in self._agents.values():
+            kill_agent_process(agent)
         self._agents.clear()
-        self._locks.clear()

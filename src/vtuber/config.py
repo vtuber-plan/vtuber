@@ -58,6 +58,11 @@ class VTuberConfig(BaseModel):
         default_factory=lambda: ["~/.vtuber"],
         description="Directories where the agent is allowed to write files",
     )
+    max_agents: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum number of concurrent agent sessions (LRU eviction when full)",
+    )
     tavily_api_key: str = Field(
         default="",
         description="Tavily API key for web search (get one at https://tavily.com)",

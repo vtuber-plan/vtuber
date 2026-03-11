@@ -25,12 +25,12 @@ from vtuber.config import (
     migrate_config,
     reset_config,
 )
-from vtuber.daemon.agents import GroupAgentManager, create_agent, safe_disconnect
+from vtuber.daemon.agents import AgentPool
 from vtuber.daemon.gateway import Gateway, ProviderConnection
 from vtuber.daemon.heartbeat import HeartbeatManager
 from vtuber.daemon.protocol import MessageType, decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, kill_agent_process, truncate
+from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
 from vtuber.tools.memory import SessionManager
 from vtuber.tools.schedule import set_scheduler, set_task_queue
@@ -76,19 +76,23 @@ class DaemonServer:
         self.socket_path = socket_path or get_socket_path()
         self.is_running = False
         self.gateway = Gateway()
-        self.agent: ClaudeSDKClient | None = None
+        self.agent_pool: AgentPool | None = None
         self.scheduler: TaskScheduler | None = None
         self._server: asyncio.Server | None = None
         self._task_queue: asyncio.Queue = asyncio.Queue()
-        self._agent_lock = asyncio.Lock()
-        self.group_agents = GroupAgentManager()
-        self.session_id = "cli:main"  # Default CLI session
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self.session_manager = SessionManager(get_sessions_dir())
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
 
         # Subsystems (initialized in start())
         self._heartbeat: HeartbeatManager | None = None
         self._task_runner: ScheduledTaskRunner | None = None
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create a per-session lock for concurrent session isolation."""
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
 
     async def start(self):
         """Start the daemon server."""
@@ -111,17 +115,19 @@ class DaemonServer:
         set_scheduler(self.scheduler)
         self.scheduler.start()
 
-        # Start scheduled task runner
-        self._task_runner = ScheduledTaskRunner(self.gateway, self._task_queue)
-        self._task_runner.start()
-        logger.info("Scheduler started (db=%s)", db_path)
-
-        # Initialize main agent
-        self.agent = await create_agent(
+        # Initialize agent pool (agents are created lazily on first message)
+        config = get_config()
+        self.agent_pool = AgentPool(
+            max_agents=config.max_agents,
             include_schedule=True,
             include_preset_tools=True,
         )
-        logger.info("Agent initialized")
+        logger.info("Agent pool initialized (max=%d)", config.max_agents)
+
+        # Start scheduled task runner (needs agent to be ready)
+        self._task_runner = ScheduledTaskRunner(self, self._task_queue)
+        self._task_runner.start()
+        logger.info("Scheduler started (db=%s)", db_path)
 
         # Start Unix socket server
         self._server = await asyncio.start_unix_server(
@@ -131,9 +137,8 @@ class DaemonServer:
         self.is_running = True
 
         # Start heartbeat
-        config = get_config()
         self._heartbeat = HeartbeatManager(
-            self.gateway, self.session_id, config.heartbeat_interval,
+            self.gateway, config.heartbeat_interval,
         )
         self._heartbeat.start()
 
@@ -142,8 +147,8 @@ class DaemonServer:
         pid_path.write_text(str(os.getpid()))
 
         logger.info(
-            "Daemon started on %s (pid=%d, session=%s)",
-            self.socket_path, os.getpid(), self.session_id,
+            "Daemon started on %s (pid=%d)",
+            self.socket_path, os.getpid(),
         )
 
         # Setup signal handlers
@@ -221,16 +226,21 @@ class DaemonServer:
                 is_private = msg.get("is_private", True)
                 channel_id = msg.get("channel_id")
                 context = msg.get("context")
+                session_id = msg.get("session_id")
                 pid = provider_id or msg.get("provider_id")
 
                 if not pid:
                     logger.warning("User message from unregistered provider, ignoring")
                 elif is_private:
-                    await self._handle_private_message(content, pid, sender, is_owner)
+                    await self._handle_private_message(
+                        content, pid, sender, is_owner,
+                        session_id=session_id,
+                    )
                 else:
                     await self._handle_group_message(
                         content, pid, sender, is_owner,
                         channel_id=channel_id, context=context,
+                        session_id=session_id,
                     )
 
             elif msg_type == MessageType.PING:
@@ -253,16 +263,14 @@ class DaemonServer:
 
     async def _handle_private_message(
         self, content: str, provider_id: str, sender: str, is_owner: bool,
+        *, session_id: str | None = None,
     ):
-        """Handle a private/DM message — routes to the main agent."""
-        if not self.agent:
-            await self.gateway.send_to(provider_id, {
-                "type": MessageType.ERROR,
-                "content": "Agent not initialized",
-            })
-            return
+        """Handle a private/DM message — routes to a per-session agent."""
+        # Use explicit session_id, or derive from provider + sender.
+        # Each distinct sender gets their own session even within the same provider.
+        session_id = session_id or f"dm:{provider_id}:{sender}"
 
-        session = self.session_manager.get_or_create(self.session_id)
+        session = self.session_manager.get_or_create(session_id)
         session.add_message("user", content, sender=sender)
         self.session_manager.save(session)
         logger.debug("[%s] %s", sender, truncate(content))
@@ -270,11 +278,11 @@ class DaemonServer:
         query_content = content if is_owner else f"[{sender}]: {content}"
 
         try:
-            logger.debug("Acquiring agent lock...")
-            async with self._agent_lock:
-                logger.debug("Agent lock acquired, sending query")
+            agent = await self.agent_pool.get(session_id)
+            lock = self._get_session_lock(session_id)
+            async with lock:
                 await self._run_agent_query(
-                    self.agent, query_content, provider_id, "agent",
+                    agent, query_content, provider_id, session_id, "agent",
                 )
             if self._heartbeat:
                 self._heartbeat.on_message()
@@ -284,7 +292,7 @@ class DaemonServer:
                 "type": MessageType.ERROR,
                 "content": "Agent 响应超时，正在恢复...",
             })
-            await self._recover_agent()
+            await self.agent_pool.kill_and_recreate(session_id)
         except Exception as e:
             logger.error("[agent] error handling message: %s", e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -301,9 +309,13 @@ class DaemonServer:
         *,
         channel_id: str | None = None,
         context: list[dict] | None = None,
+        session_id: str | None = None,
     ):
-        """Handle a group chat message — routes to a per-channel persistent agent."""
+        """Handle a group chat message — routes to a per-channel agent."""
         channel_label = channel_id or "unknown"
+        # Use explicit session_id, or derive from channel.
+        # Each distinct channel gets its own session.
+        session_id = session_id or f"group:{channel_label}"
         logger.debug("[group/%s] %s: %s", channel_label, sender, truncate(content))
 
         query_parts = []
@@ -315,18 +327,26 @@ class DaemonServer:
         query_parts.append(f"[{sender}]: {content}")
         query_text = "\n".join(query_parts)
 
-        try:
-            agent = await self.group_agents.get_or_create(channel_label)
-            lock = self.group_agents.get_lock(channel_label)
+        # Prepend group chat instruction for this session
+        group_instruction = (
+            f"你正在参与一个群聊（频道: {channel_label}）。\n"
+            "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
+            "如果对话不需要你参与，请只回复: NO_RESPONSE\n"
+            "如果需要回复，直接回复内容即可，不要加任何前缀。\n\n"
+        )
 
+        try:
+            agent = await self.agent_pool.get(session_id)
+            lock = self._get_session_lock(session_id)
             async with lock:
                 await self._run_agent_query(
-                    agent, query_text, provider_id, f"group/{channel_label}",
+                    agent, group_instruction + query_text, provider_id, session_id,
+                    f"group/{channel_label}",
                     no_response_token="NO_RESPONSE",
                 )
         except AgentTimeoutError as e:
             logger.error("[group/%s] timeout: %s — recovering agent", channel_label, e)
-            await self.group_agents.recover(channel_label)
+            await self.agent_pool.kill_and_recreate(session_id)
         except Exception as e:
             logger.error("[group/%s] error: %s", channel_label, e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -334,40 +354,22 @@ class DaemonServer:
                 "content": str(e),
             })
 
-    async def _recover_agent(self) -> None:
-        """Recover from a hung agent by killing its subprocess and creating a new one."""
-        logger.warning("Recovering agent — killing old subprocess")
-        if self.agent:
-            kill_agent_process(self.agent)
-            await safe_disconnect(self.agent)
-            self.agent = None
-
-        self.agent = await create_agent(
-            include_schedule=True,
-            include_preset_tools=True,
-        )
-        logger.info("Agent recovered (new session)")
-
     async def _handle_reload(self, writer: asyncio.StreamWriter) -> None:
         """Reload agents with fresh prompts (hot-reload)."""
-        logger.info("Reload requested — rebuilding agents with fresh prompts")
+        logger.info("Reload requested — killing all agents and resetting config")
         try:
-            async with self._agent_lock:
-                reset_config()
+            reset_config()
+            self.agent_pool.kill_all_and_clear()
 
-                if self.agent:
-                    kill_agent_process(self.agent)
-                    await safe_disconnect(self.agent)
-                    self.agent = None
+            # Reinitialize pool with fresh config
+            config = get_config()
+            self.agent_pool = AgentPool(
+                max_agents=config.max_agents,
+                include_schedule=True,
+                include_preset_tools=True,
+            )
 
-                self.agent = await create_agent(
-                    include_schedule=True,
-                    include_preset_tools=True,
-                )
-
-            await self.group_agents.close_all()
-
-            logger.info("Reload complete — agents rebuilt")
+            logger.info("Reload complete — agent pool reset (max=%d)", config.max_agents)
             response = encode_message({
                 "type": MessageType.PONG,
                 "message": "reload ok",
@@ -390,6 +392,7 @@ class DaemonServer:
         agent: ClaudeSDKClient,
         query: str,
         provider_id: str,
+        session_id: str,
         log_source: str,
         *,
         no_response_token: str | None = None,
@@ -402,12 +405,15 @@ class DaemonServer:
 
         Guarantees that a done=True message is always sent, even on error.
         """
+
         step = 0
         full_text = ""
         done_sent = False
 
         try:
-            async for event in iter_response(agent, query, log_source=log_source):
+            async for event in iter_response(
+                agent, query, session_id=session_id, log_source=log_source,
+            ):
                 if event.type == "tool":
                     await self.gateway.send_to(provider_id, {
                         "type": MessageType.PROGRESS,
@@ -454,7 +460,7 @@ class DaemonServer:
                 and no_response_token in full_text.strip().upper()
             )
             if not is_no_response:
-                session = self.session_manager.get_or_create(self.session_id)
+                session = self.session_manager.get_or_create(session_id)
                 session.add_message("assistant", full_text.strip())
                 self.session_manager.save(session)
 
@@ -473,16 +479,18 @@ class DaemonServer:
         if self._task_runner:
             await self._task_runner.stop()
 
-        # Disconnect agents
-        if self.agent:
+        # Disconnect all agents
+        if self.agent_pool:
             try:
-                await self.agent.disconnect()
+                await self.agent_pool.close_all()
             except Exception:
                 pass
-        await self.group_agents.close_all()
 
         # Close provider connections
-        await self.gateway.close_all()
+        try:
+            await self.gateway.close_all()
+        except BaseException:
+            pass
 
         # Shutdown scheduler
         if self.scheduler:

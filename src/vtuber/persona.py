@@ -26,7 +26,15 @@ Write important facts immediately using Tools:
 
 ## Auto-consolidation
 
-Old conversations are automatically summarized to HISTORY.md and MEMORY.md. You don't manage this."""
+Old conversations are automatically summarized to HISTORY.md and MEMORY.md. You don't manage this.
+
+## Web Research
+
+When you need to search the web or fetch web pages, ALWAYS delegate to the **web-researcher** agent.
+Do NOT call web_search or web_fetch tools directly. Instead, use the Agent tool:
+- Describe what you need to find clearly
+- The web-researcher will search/fetch and return a concise summary
+- This keeps your context clean and focused"""
 
 LONG_TERM_MEMORY_HEADER = """## Long-term Memory
 

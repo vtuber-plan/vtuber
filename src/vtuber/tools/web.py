@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 _DEFAULT_TIMEOUT = 30.0
-_MAX_FETCH_LENGTH = 20000
+_DEFAULT_READ_LENGTH = 10000
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -87,7 +87,11 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "web_fetch",
-    "Fetch a web page and extract its main text content. Returns clean text without HTML.",
+    (
+        "Fetch a web page and extract its main text content. Returns clean text without HTML. "
+        "Use 'offset' and 'limit' to read specific portions of long pages (like the Read tool). "
+        "The response includes total_length so you can request remaining content if needed."
+    ),
     {
         "type": "object",
         "properties": {
@@ -95,14 +99,24 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
                 "type": "string",
                 "description": "URL to fetch",
             },
+            "offset": {
+                "type": "integer",
+                "description": "Character offset to start reading from (default 0)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": f"Max characters to return (default {_DEFAULT_READ_LENGTH})",
+            },
         },
         "required": ["url"],
     },
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
 )
 async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
-    """Fetch a web page and extract main text content."""
+    """Fetch a web page and extract main text content with pagination support."""
     url = args["url"]
+    offset = max(args.get("offset", 0) or 0, 0)
+    limit = max(args.get("limit", _DEFAULT_READ_LENGTH) or _DEFAULT_READ_LENGTH, 1)
 
     if not url.startswith(("http://", "https://")):
         return _text("Error: URL must start with http:// or https://")
@@ -134,15 +148,56 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
     text = trafilatura.extract(html, include_links=True, include_tables=True)
 
     if not text:
-        # Fallback: return raw text, stripped of excessive whitespace
-        text = html[:_MAX_FETCH_LENGTH]
-        text = f"[Trafilatura extraction failed, showing raw content]\n\n{text}"
+        text = html
+        extraction_note = "[Trafilatura extraction failed, showing raw content]\n\n"
+    else:
+        extraction_note = ""
 
-    # Truncate if needed
-    if len(text) > _MAX_FETCH_LENGTH:
-        text = text[:_MAX_FETCH_LENGTH] + f"\n\n[Content truncated at {_MAX_FETCH_LENGTH} characters]"
+    total_length = len(text)
+    chunk = text[offset:offset + limit]
 
-    return _text(f"URL: {url}\n\n{text}")
+    header = f"URL: {url}\n"
+    header += f"Total length: {total_length} chars | Showing: {offset}-{offset + len(chunk)}"
+    if offset + len(chunk) < total_length:
+        remaining = total_length - offset - len(chunk)
+        header += f" | {remaining} chars remaining (use offset={offset + len(chunk)} to continue)"
+    header += "\n\n"
+
+    return _text(f"{header}{extraction_note}{chunk}")
+
+@tool(
+    name="add_numbers",
+    description="Add two or more numbers together. Pass numbers as an array of integers or floats, e.g., {\"numbers\": [1, 2, 3]}",
+    input_schema={"numbers": list},
+)
+async def add_numbers(args: dict[str, Any]) -> dict[str, Any]:
+    """计算数字相加的工具"""
+    numbers = args.get("numbers", [])
+    if not numbers:
+        return {
+            "content": [{"type": "text", "text": "Error: No numbers provided"}],
+            "is_error": True,
+        }
+
+    # 处理可能是字符串的情况（如 "1, 2, 3"）
+    if isinstance(numbers, str):
+        try:
+            # 尝试解析逗号或空格分隔的数字
+            numbers = [float(x.strip()) for x in numbers.replace(",", " ").split()]
+        except ValueError:
+            return {
+                "content": [{"type": "text", "text": "Error: Invalid number format. Please provide an array of numbers."}],
+                "is_error": True,
+            }
+
+    try:
+        result = sum(float(n) for n in numbers)
+        return {"content": [{"type": "text", "text": f"Sum: {result}"}]}
+    except (TypeError, ValueError) as e:
+        return {
+            "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+            "is_error": True,
+        }
 
 
 def _text(text: str) -> dict[str, Any]:
