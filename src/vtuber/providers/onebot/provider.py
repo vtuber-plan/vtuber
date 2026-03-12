@@ -11,6 +11,9 @@ from rich.console import Console
 from vtuber.config import get_config
 from vtuber.providers.base import ChatMessage, Provider
 
+from .events import handle_onebot_event
+from .render import render_text_as_image, should_render_as_image
+
 logger = logging.getLogger("vtuber.provider.onebot")
 console = Console()
 
@@ -23,19 +26,6 @@ class _PendingResponse:
     user_id: int | None = None
     group_id: int | None = None
     chunks: list[str] = field(default_factory=list)
-
-
-def _extract_text(message) -> str:
-    """Extract plain text from an OneBot message (string or segment array)."""
-    if isinstance(message, str):
-        return message
-    if isinstance(message, list):
-        parts = []
-        for seg in message:
-            if isinstance(seg, dict) and seg.get("type") == "text":
-                parts.append(seg.get("data", {}).get("text", ""))
-        return "".join(parts)
-    return str(message)
 
 
 class OneBotProvider(Provider):
@@ -51,6 +41,8 @@ class OneBotProvider(Provider):
         owner_id: QQ user ID of the bot owner
         bot_names: List of names the bot responds to in group chat
         group_batch_size: Forward to agent every N messages (0 = disabled)
+        text2img_url: Text2Image service URL (empty = disabled)
+        long_text_threshold: Character count threshold for image rendering
     """
 
     provider_type = "onebot"
@@ -68,6 +60,8 @@ class OneBotProvider(Provider):
         self._group_batch_size: int = int(cfg.get("group_batch_size", 0))
         self._bot_names: list[str] = [str(n) for n in cfg.get("bot_names", []) if n]
         self._stream_intermediate: bool = bool(cfg.get("stream_intermediate", False))
+        self._text2img_url: str = cfg.get("text2img_url", "").rstrip("/")
+        self._long_text_threshold: int = int(cfg.get("long_text_threshold", 300))
 
         self._ws = None  # websockets connection
         self._ws_task: asyncio.Task | None = None
@@ -76,6 +70,7 @@ class OneBotProvider(Provider):
         self._group_unseen: dict[int, int] = {}  # group_id -> messages since last forward
         self._self_id: int | None = None  # bot's own QQ ID (from lifecycle event)
         self._action_echo: int = 0  # echo counter for action requests
+        self._api_futures: dict[str, asyncio.Future] = {}  # echo -> Future
 
     # ── OneBot WebSocket ──────────────────────────────────────────
 
@@ -114,163 +109,82 @@ class OneBotProvider(Provider):
             async for raw in self._ws:
                 try:
                     event = json.loads(raw)
-                    await self._handle_onebot_event(event)
+                    await handle_onebot_event(self, event)
                 except json.JSONDecodeError:
                     logger.warning("Invalid JSON from OneBot: %s", raw[:200])
                 except Exception as e:
                     logger.error("Error handling OneBot event: %s", e)
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception as e:
             if self.running:
-                logger.error("OneBot WebSocket error: %s", e)
-                self.running = False
+                logger.error("OneBot WebSocket disconnected: %s", e)
+        finally:
+            # Cancel stale API futures
+            for fut in self._api_futures.values():
+                if not fut.done():
+                    fut.cancel()
+            self._api_futures.clear()
 
-    async def _send_onebot_action(self, action: str, params: dict, **kwargs) -> None:
-        """Send an action request to OneBot."""
+    async def _reconnect_loop(self) -> None:
+        """Reconnect to OneBot WebSocket with exponential backoff."""
+        delay = 2.0
+        max_delay = 60.0
+
+        while self.running:
+            logger.info("Attempting OneBot reconnect in %.1fs...", delay)
+            await asyncio.sleep(delay)
+
+            if not self.running:
+                break
+
+            if await self._connect_onebot():
+                logger.info("OneBot reconnected successfully")
+                console.print("[green]OneBot 已重新连接[/green]")
+                delay = 2.0  # reset backoff
+                await self._onebot_read_loop()
+                # If read loop exits and we're still running, loop will retry
+            else:
+                delay = min(delay * 2, max_delay)
+
+    # ── OneBot API ────────────────────────────────────────────────
+
+    async def send_onebot_action(
+        self, action: str, params: dict, *, wait: bool = False, timeout: float = 10.0,
+    ) -> dict | None:
+        """Send an action request to OneBot.
+
+        If *wait* is ``True``, block until the response is received (correlated
+        by ``echo``).  Returns the full response dict, or ``None`` on timeout.
+        """
         if not self._ws:
-            return
+            return None
         self._action_echo += 1
-        payload = {"action": action, "params": params, "echo": str(self._action_echo)}
+        echo_str = str(self._action_echo)
+        payload = {"action": action, "params": params, "echo": echo_str}
+
+        future: asyncio.Future | None = None
+        if wait:
+            future = asyncio.get_event_loop().create_future()
+            self._api_futures[echo_str] = future
+
         try:
             await self._ws.send(json.dumps(payload, ensure_ascii=False))
         except Exception as e:
             logger.error("Failed to send OneBot action %s: %s", action, e)
+            if future:
+                self._api_futures.pop(echo_str, None)
+            return None
 
-    # ── Event Handling ────────────────────────────────────────────
-
-    async def _handle_onebot_event(self, event: dict) -> None:
-        """Dispatch an incoming OneBot event."""
-        post_type = event.get("post_type")
-
-        if post_type == "meta_event":
-            await self._handle_meta_event(event)
-        elif post_type == "message":
-            await self._handle_message_event(event)
-
-    async def _handle_meta_event(self, event: dict) -> None:
-        """Handle meta events (lifecycle, heartbeat)."""
-        meta_type = event.get("meta_event_type")
-        if meta_type == "lifecycle":
-            self._self_id = event.get("self_id")
-            sub = event.get("sub_type", "")
-            logger.info("OneBot lifecycle: %s (self_id=%s)", sub, self._self_id)
-        # heartbeat events are silently ignored
-
-    async def _handle_message_event(self, event: dict) -> None:
-        """Handle incoming message events (private & group)."""
-        message_type = event.get("message_type")
-        user_id = event.get("user_id")
-        raw_message = event.get("raw_message", "")
-        message = event.get("message", raw_message)
-        text = _extract_text(message).strip()
-
-        if not text or user_id == self._self_id:
-            return
-
-        # Whitelist filtering — owner always passes
-        is_owner = self.owner_id and str(user_id) == self.owner_id
-
-        if message_type == "private":
-            if not is_owner and self._user_whitelist and str(user_id) not in self._user_whitelist:
-                return
-        elif message_type == "group":
-            group_id = event.get("group_id")
-            if self._group_whitelist and str(group_id) not in self._group_whitelist:
-                return
-
-        sender_info = event.get("sender", {})
-        nickname = (
-            sender_info.get("card")  # group card first
-            or sender_info.get("nickname")
-            or str(user_id)
-        )
-
-        if message_type == "private":
-            session_id = f"onebot:private:{user_id}"
-            self._pending[session_id] = _PendingResponse(
-                reply_to="private", user_id=user_id,
-            )
-            await self.send_message(
-                text,
-                sender=nickname,
-                is_owner=is_owner,
-                is_private=True,
-                session_id=session_id,
-            )
-            logger.debug("Private msg from %s(%s): %s", nickname, user_id, text[:50])
-
-        elif message_type == "group":
-            group_id = event.get("group_id")
-            if not group_id:
-                return
-
-            # Maintain group context ring buffer
-            ctx = self._group_context.setdefault(group_id, [])
-            ctx.append(ChatMessage(sender=nickname, content=text))
-            limit = get_config().group_context_limit
-            if len(ctx) > limit:
-                self._group_context[group_id] = ctx[-limit:]
-
-            # Track unseen message count
-            self._group_unseen[group_id] = self._group_unseen.get(group_id, 0) + 1
-
-            # Determine whether to forward to daemon
-            should_forward = False
-
-            # 1. Check if bot is @-mentioned (CQ at segment)
-            if isinstance(message, list):
-                for seg in message:
-                    if (
-                        isinstance(seg, dict)
-                        and seg.get("type") == "at"
-                        and str(seg.get("data", {}).get("qq")) == str(self._self_id)
-                    ):
-                        should_forward = True
-                        break
-
-            # 2. Check if bot name is mentioned in text
-            if not should_forward and self._bot_names:
-                text_lower = text.lower()
-                for name in self._bot_names:
-                    if name.lower() in text_lower:
-                        should_forward = True
-                        break
-
-            # 3. Check if accumulated messages reached batch threshold
-            if (
-                not should_forward
-                and self._group_batch_size > 0
-                and self._group_unseen[group_id] >= self._group_batch_size
-            ):
-                should_forward = True
-
-            if not should_forward:
-                return
-
-            # Reset unseen counter on forward
-            self._group_unseen[group_id] = 0
-
-            session_id = f"onebot:group:{group_id}"
-            # Use recent context (excluding the trigger message itself)
-            context = list(self._group_context.get(group_id, []))[:-1]
-
-            self._pending[session_id] = _PendingResponse(
-                reply_to="group", group_id=group_id,
-            )
-            await self.send_message(
-                text,
-                sender=nickname,
-                is_owner=is_owner,
-                is_private=False,
-                channel_id=str(group_id),
-                session_id=session_id,
-                context=context[-get_config().group_context_limit:],
-            )
-            logger.debug(
-                "Group msg from %s(%s) in %s: %s",
-                nickname, user_id, group_id, text[:50],
-            )
+        if future:
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.warning("OneBot action %s timed out", action)
+                return None
+            finally:
+                self._api_futures.pop(echo_str, None)
+        return None
 
     # ── Daemon Message Dispatch (override for session routing) ──
 
@@ -312,7 +226,7 @@ class OneBotProvider(Provider):
         elif msg_type == MessageType.HEARTBEAT_MESSAGE:
             content = msg.get("content", "")
             if content.strip() and self.owner_id:
-                await self._send_onebot_action("send_private_msg", {
+                await self.send_onebot_action("send_private_msg", {
                     "user_id": int(self.owner_id),
                     "message": content,
                 })
@@ -323,7 +237,7 @@ class OneBotProvider(Provider):
             done = msg.get("done", True)
             if done and content.strip() and self.owner_id:
                 text = f"[定时任务] {task}\n{content}" if task else content
-                await self._send_onebot_action("send_private_msg", {
+                await self.send_onebot_action("send_private_msg", {
                     "user_id": int(self.owner_id),
                     "message": text,
                 })
@@ -336,16 +250,27 @@ class OneBotProvider(Provider):
     # ── Reply Helper ──────────────────────────────────────────────
 
     async def _send_reply(self, pending: _PendingResponse, text: str) -> None:
-        """Send a reply through OneBot."""
+        """Send a reply through OneBot, rendering as image if needed."""
+        message: str | list[dict] = text
+
+        if should_render_as_image(
+            text,
+            threshold=self._long_text_threshold,
+            enabled=bool(self._text2img_url),
+        ):
+            image_url = await render_text_as_image(text, self._text2img_url)
+            if image_url:
+                message = [{"type": "image", "data": {"file": image_url}}]
+
         if pending.reply_to == "private" and pending.user_id:
-            await self._send_onebot_action("send_private_msg", {
+            await self.send_onebot_action("send_private_msg", {
                 "user_id": pending.user_id,
-                "message": text,
+                "message": message,
             })
         elif pending.reply_to == "group" and pending.group_id:
-            await self._send_onebot_action("send_group_msg", {
+            await self.send_onebot_action("send_group_msg", {
                 "group_id": pending.group_id,
-                "message": text,
+                "message": message,
             })
 
     # ── Main Loop ─────────────────────────────────────────────────
@@ -360,7 +285,7 @@ class OneBotProvider(Provider):
             )
             return
 
-        console.print(f"[green]已连接到 VTuber daemon[/green]")
+        console.print("[green]已连接到 VTuber daemon[/green]")
 
         # Connect to OneBot
         if not await self._connect_onebot():
@@ -377,11 +302,15 @@ class OneBotProvider(Provider):
             f"等待消息中..."
         )
 
-        # Start OneBot reader loop
-        self._ws_task = asyncio.create_task(self._onebot_read_loop())
+        # Start OneBot reader loop with reconnect support
+        async def _read_then_reconnect() -> None:
+            await self._onebot_read_loop()
+            if self.running:
+                await self._reconnect_loop()
+
+        self._ws_task = asyncio.create_task(_read_then_reconnect())
 
         try:
-            # Wait until either connection dies
             while self.running:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -403,6 +332,11 @@ class OneBotProvider(Provider):
                 await self._ws.close()
             except Exception:
                 pass
+        # Cancel stale API futures
+        for fut in self._api_futures.values():
+            if not fut.done():
+                fut.cancel()
+        self._api_futures.clear()
         await self.disconnect()
         console.print("[dim]OneBot provider 已停止[/dim]")
 
@@ -418,7 +352,3 @@ def main():
     except Exception as e:
         console.print(f"[red]OneBot provider 错误：{e}[/red]")
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

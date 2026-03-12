@@ -29,6 +29,8 @@ _ONEBOT_DEFAULTS: dict[str, Any] = {
     "stream_intermediate": False,
     "user_whitelist": [],
     "group_whitelist": [],
+    "text2img_url": "",
+    "long_text_threshold": 300,
 }
 
 
