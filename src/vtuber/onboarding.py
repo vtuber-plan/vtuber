@@ -21,8 +21,8 @@ from claude_agent_sdk.types import (
 
 import shutil
 
-from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir, ensure_plugins_dir, migrate_config
-from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT, DEFAULT_CONFIG
+from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir, ensure_plugins_dir, migrate_config, generate_config_yaml
+from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT
 from vtuber.utils import extract_stream_text
 
 console = Console()
@@ -256,7 +256,7 @@ def create_default_configs():
         heartbeat_path.write_text(DEFAULT_HEARTBEAT, encoding="utf-8")
 
     if not config_path.exists():
-        config_path.write_text(DEFAULT_CONFIG, encoding="utf-8")
+        config_path.write_text(generate_config_yaml(), encoding="utf-8")
 
     # Copy built-in commands to workspace .claude/commands/ (Claude's native loading)
     builtin_skills = Path(__file__).parent / "skills"

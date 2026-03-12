@@ -102,8 +102,8 @@ async def iter_response(
     *,
     session_id: str = "default",
     log_source: str = "agent",
-    query_timeout: float = 30.0,
-    idle_timeout: float = 1200.0,
+    query_timeout: float | None = None,
+    idle_timeout: float | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Query a persistent agent and yield typed events.
 
@@ -116,6 +116,12 @@ async def iter_response(
     Raises:
         AgentTimeoutError: If agent.query() or receive_response() times out.
     """
+    from vtuber.config import get_config
+
+    if query_timeout is None:
+        query_timeout = get_config().query_timeout
+    if idle_timeout is None:
+        idle_timeout = get_config().idle_timeout
     try:
         await asyncio.wait_for(agent.query(query, session_id=session_id), timeout=query_timeout)
     except asyncio.TimeoutError:

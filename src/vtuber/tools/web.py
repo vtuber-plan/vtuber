@@ -12,7 +12,6 @@ from vtuber.config import get_config
 logger = logging.getLogger(__name__)
 
 _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-_DEFAULT_TIMEOUT = 30.0
 _DEFAULT_READ_LENGTH = 10000
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -52,7 +51,7 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
     max_results = min(max(args.get("max_results", 5), 1), 10)
 
     try:
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=get_config().web_timeout) as client:
             resp = await client.post(
                 _TAVILY_SEARCH_URL,
                 json={
@@ -123,7 +122,7 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(
-            timeout=_DEFAULT_TIMEOUT,
+            timeout=get_config().web_timeout,
             follow_redirects=True,
             headers={"User-Agent": _USER_AGENT},
         ) as client:

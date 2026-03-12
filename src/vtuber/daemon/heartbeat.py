@@ -104,7 +104,7 @@ class HeartbeatManager:
     def on_message(self):
         """Called after each user message to track consolidation threshold."""
         self.message_count += 1
-        if self.message_count >= 50 and not self._consolidation_running:
+        if self.message_count >= get_config().consolidation_threshold and not self._consolidation_running:
             self._consolidation_task = asyncio.create_task(self._consolidate())
 
     async def _loop(self):
@@ -227,7 +227,7 @@ class HeartbeatManager:
             manager = SessionManager(sessions_dir)
 
             # Find sessions that need consolidation
-            keep_count = 25
+            keep_count = get_config().consolidation_keep_count
             for info in manager.list_sessions():
                 session_key = info.get("key")
                 if not session_key:

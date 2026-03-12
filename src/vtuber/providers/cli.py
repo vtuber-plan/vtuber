@@ -15,6 +15,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -90,6 +91,9 @@ class CLIProvider(QueuedProvider):
         self.session = PromptSession(
             history=FileHistory(str(history_path)),
             bottom_toolbar=self._get_toolbar,
+            style=Style.from_dict({
+                "bottom-toolbar": "bg:#000000 noreverse",
+            }),
         )
 
         # Status for toolbar
@@ -110,10 +114,10 @@ class CLIProvider(QueuedProvider):
         if self._status:
             frame = self._spinner_frames[self._spinner_idx % len(self._spinner_frames)]
             return HTML(
-                f'<style fg="ansibrightcyan"> {frame} {self._status}</style>'
+                f'<style fg="ansicyan" bg="ansiblack"> {frame} {self._status}</style>'
             )
         return HTML(
-            '<style fg="ansigray"> Alt+Enter 换行，Enter 发送</style>'
+            '<style fg="ansicyan" bg="ansiblack"> Enter 发送</style>'
         )
 
     def _invalidate(self) -> None:

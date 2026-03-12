@@ -14,9 +14,6 @@ from vtuber.providers.base import ChatMessage, Provider
 logger = logging.getLogger("vtuber.provider.onebot")
 console = Console()
 
-# Number of recent group messages to keep as context per channel
-GROUP_CONTEXT_LIMIT = 20
-
 
 @dataclass
 class _PendingResponse:
@@ -211,8 +208,9 @@ class OneBotProvider(Provider):
             # Maintain group context ring buffer
             ctx = self._group_context.setdefault(group_id, [])
             ctx.append(ChatMessage(sender=nickname, content=text))
-            if len(ctx) > GROUP_CONTEXT_LIMIT:
-                self._group_context[group_id] = ctx[-GROUP_CONTEXT_LIMIT:]
+            limit = get_config().group_context_limit
+            if len(ctx) > limit:
+                self._group_context[group_id] = ctx[-limit:]
 
             # Track unseen message count
             self._group_unseen[group_id] = self._group_unseen.get(group_id, 0) + 1
@@ -267,7 +265,7 @@ class OneBotProvider(Provider):
                 is_private=False,
                 channel_id=str(group_id),
                 session_id=session_id,
-                context=context[-GROUP_CONTEXT_LIMIT:],
+                context=context[-get_config().group_context_limit:],
             )
             logger.debug(
                 "Group msg from %s(%s) in %s: %s",
