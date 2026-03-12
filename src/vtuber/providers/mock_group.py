@@ -213,16 +213,29 @@ class MockGroupProvider(QueuedProvider):
                 console.print()
                 console.print("[dim]>>> 发送 {0} 条消息给 Agent...[/dim]".format(len(buffer)))
 
-                trigger = buffer[-1]
-                context = buffer[:-1]
+                session_id = f"mock:group:{CHANNEL_ID}"
 
+                # Send context messages (should_reply=False) then trigger (should_reply=True)
+                for msg in buffer[:-1]:
+                    await self.send_message(
+                        msg.content,
+                        sender=msg.sender,
+                        is_owner=(msg.sender == "You"),
+                        is_private=False,
+                        should_reply=False,
+                        channel_id=CHANNEL_ID,
+                        session_id=session_id,
+                    )
+
+                trigger = buffer[-1]
                 await self.send_message(
                     trigger.content,
                     sender=trigger.sender,
                     is_owner=(trigger.sender == "You"),
                     is_private=False,
+                    should_reply=True,
                     channel_id=CHANNEL_ID,
-                    context=context,
+                    session_id=session_id,
                 )
 
                 response = await self._wait_for_response()

@@ -172,15 +172,20 @@ class AgentPool:
     """Manages a pool of ClaudeSDKClient instances, one per session_id.
 
     Agents are lazily created on first access and evicted LRU when the pool
-    reaches ``max_agents``.
+    reaches ``max_agents``.  Different session types (e.g. private vs group)
+    can use different agent configurations via *profiles*.
     """
 
-    def __init__(self, max_agents: int = 5, **create_kwargs):
+    def __init__(
+        self,
+        max_agents: int = 5,
+        profiles: dict[str, dict] | None = None,
+    ):
         self._agents: OrderedDict[str, ClaudeSDKClient] = OrderedDict()
         self._max = max_agents
-        self._create_kwargs = create_kwargs
+        self._profiles: dict[str, dict] = profiles or {"private": {}}
 
-    async def get(self, session_id: str) -> ClaudeSDKClient:
+    async def get(self, session_id: str, profile: str = "private") -> ClaudeSDKClient:
         """Get or create an agent for *session_id*.  LRU eviction when full."""
         if session_id in self._agents:
             self._agents.move_to_end(session_id)
@@ -192,11 +197,12 @@ class AgentPool:
             await safe_disconnect(oldest_agent)
             logger.info("Evicted agent for session %s", oldest_id)
 
-        agent = await create_agent(**self._create_kwargs)
+        kwargs = self._profiles.get(profile, self._profiles.get("private", {}))
+        agent = await create_agent(**kwargs)
         self._agents[session_id] = agent
         logger.info(
-            "Created agent for session %s (pool=%d/%d)",
-            session_id, len(self._agents), self._max,
+            "Created %s agent for session %s (pool=%d/%d)",
+            profile, session_id, len(self._agents), self._max,
         )
         return agent
 
@@ -211,13 +217,15 @@ class AgentPool:
             await safe_disconnect(agent)
         self._agents.clear()
 
-    async def kill_and_recreate(self, session_id: str) -> ClaudeSDKClient:
+    async def kill_and_recreate(
+        self, session_id: str, profile: str = "private",
+    ) -> ClaudeSDKClient:
         """Kill a hung agent and create a fresh one for the session."""
         from vtuber.daemon.agent_query import kill_agent_process
 
         if agent := self._agents.pop(session_id, None):
             kill_agent_process(agent)
-        return await self.get(session_id)
+        return await self.get(session_id, profile=profile)
 
     def kill_all_and_clear(self) -> None:
         """Kill all agent subprocesses immediately (for reload/recovery)."""

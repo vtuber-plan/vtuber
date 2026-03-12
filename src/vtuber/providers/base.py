@@ -85,9 +85,9 @@ class Provider(ABC):
         sender: str = "owner",
         is_owner: bool = True,
         is_private: bool = True,
+        should_reply: bool = True,
         channel_id: str | None = None,
         session_id: str | None = None,
-        context: list[ChatMessage] | None = None,
     ) -> None:
         """Send a user message to the daemon."""
         msg: dict = {
@@ -96,15 +96,12 @@ class Provider(ABC):
             "sender": sender,
             "is_owner": is_owner,
             "is_private": is_private,
+            "should_reply": should_reply,
         }
         if channel_id is not None:
             msg["channel_id"] = channel_id
         if session_id is not None:
             msg["session_id"] = session_id
-        if context:
-            msg["context"] = [
-                {"sender": m.sender, "content": m.content} for m in context
-            ]
         await self._send(msg)
 
     async def _send(self, msg: dict) -> None:

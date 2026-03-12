@@ -161,7 +161,7 @@ async def run_onboarding():
     console.print(
         Panel(
             "[bold]欢迎使用 VTuber 数字生命助手！[/bold]\n"
-            "[dim]Welcome to VTuber Digital Life Assistant![/dim]\n\n"
+            "[dim]Welcome to VTuber Digital Life![/dim]\n\n"
             "这是您第一次运行，让我们完成初始设置。",
             title="[bold magenta]VTuber Setup[/bold magenta]",
             border_style="magenta",

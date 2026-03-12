@@ -5,10 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from vtuber.config import get_config
-from vtuber.providers.base import ChatMessage
-
-from .message import extract_message_text, extract_text
+from .message import extract_message_text
 
 if TYPE_CHECKING:
     from .provider import OneBotProvider
@@ -113,19 +110,11 @@ async def _handle_message_event(provider: OneBotProvider, event: dict) -> None:
         if not group_id:
             return
 
-        # Maintain group context ring buffer (sync text only)
-        plain_text = extract_text(message).strip()
-        ctx = provider._group_context.setdefault(group_id, [])
-        ctx.append(ChatMessage(sender=nickname, content=plain_text or text))
-        limit = get_config().group_context_limit
-        if len(ctx) > limit:
-            provider._group_context[group_id] = ctx[-limit:]
-
         # Track unseen message count
         provider._group_unseen[group_id] = provider._group_unseen.get(group_id, 0) + 1
 
-        # Determine whether to forward to daemon
-        should_forward = False
+        # Determine whether agent should reply
+        should_reply = False
 
         # 1. Check if bot is @-mentioned
         if isinstance(message, list):
@@ -135,49 +124,50 @@ async def _handle_message_event(provider: OneBotProvider, event: dict) -> None:
                     and seg.get("type") == "at"
                     and str(seg.get("data", {}).get("qq")) == str(provider._self_id)
                 ):
-                    should_forward = True
+                    should_reply = True
                     break
 
         # 2. Check if bot name is mentioned in text
-        if not should_forward and provider._bot_names:
+        if not should_reply and provider._bot_names:
             text_lower = text.lower()
             for name in provider._bot_names:
                 if name.lower() in text_lower:
-                    should_forward = True
+                    should_reply = True
                     break
 
         # 3. Check if accumulated messages reached batch threshold
         if (
-            not should_forward
+            not should_reply
             and provider._group_batch_size > 0
             and provider._group_unseen[group_id] >= provider._group_batch_size
         ):
-            should_forward = True
+            should_reply = True
 
-        if not should_forward:
-            return
-
-        # Reset unseen counter on forward
-        provider._group_unseen[group_id] = 0
+        # Reset unseen counter when triggering reply
+        if should_reply:
+            provider._group_unseen[group_id] = 0
 
         session_id = f"onebot:group:{group_id}"
-        context = list(provider._group_context.get(group_id, []))[:-1]
 
-        provider._pending[session_id] = _PendingResponse(
-            reply_to="group", group_id=group_id,
-        )
+        # Register pending response only when expecting a reply
+        if should_reply:
+            provider._pending[session_id] = _PendingResponse(
+                reply_to="group", group_id=group_id,
+            )
+
+        # Forward every group message to daemon for session recording
         await provider.send_message(
             text,
             sender=nickname,
             is_owner=is_owner,
             is_private=False,
+            should_reply=should_reply,
             channel_id=str(group_id),
             session_id=session_id,
-            context=context[-get_config().group_context_limit :],
         )
         logger.debug(
-            "Group msg from %s(%s) in %s: %s",
-            nickname, user_id, group_id, text[:50],
+            "Group msg from %s(%s) in %s (reply=%s): %s",
+            nickname, user_id, group_id, should_reply, text[:50],
         )
 
 

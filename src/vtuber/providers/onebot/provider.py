@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from rich.console import Console
 
 from vtuber.config import get_config
-from vtuber.providers.base import ChatMessage, Provider
+from vtuber.providers.base import Provider
 
 from .events import handle_onebot_event
 from .render import render_text_as_image, should_render_as_image
@@ -66,7 +66,6 @@ class OneBotProvider(Provider):
         self._ws = None  # websockets connection
         self._ws_task: asyncio.Task | None = None
         self._pending: dict[str, _PendingResponse] = {}  # session_id -> buffer
-        self._group_context: dict[int, list[ChatMessage]] = {}  # group_id -> recent msgs
         self._group_unseen: dict[int, int] = {}  # group_id -> messages since last forward
         self._self_id: int | None = None  # bot's own QQ ID (from lifecycle event)
         self._action_echo: int = 0  # echo counter for action requests

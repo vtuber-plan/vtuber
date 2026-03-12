@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import sys
+import uuid
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeSDKClient
@@ -33,6 +34,23 @@ from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.lifecycle import consume_restart
 
 logger = logging.getLogger("vtuber.daemon")
+
+GROUP_INSTRUCTION = (
+    "You are currently participating in a group chat.\n"
+    "You will receive recent conversation messages from the group. "
+    "Please decide whether you need to participate in the conversation based on the content.\n"
+    "If the conversation doesn't require your participation, please only reply: NO_RESPONSE\n"
+    "If you need to reply, directly provide the content without adding any prefix.\n"
+    "Note, 'You' is not you, it just a user id. Your ID is <ASSISTANT>.\n"
+)
+
+
+def _build_agent_profiles() -> dict[str, dict]:
+    """Build agent creation profiles for the pool."""
+    return {
+        "private": dict(include_schedule=True, include_preset_tools=True),
+        "group": dict(prompt_suffix=GROUP_INSTRUCTION, include_preset_tools=True),
+    }
 
 
 class DaemonServer:
@@ -85,8 +103,7 @@ class DaemonServer:
         config = get_config()
         self.agent_pool = AgentPool(
             max_agents=config.max_agents,
-            include_schedule=True,
-            include_preset_tools=True,
+            profiles=_build_agent_profiles(),
         )
         logger.info("Agent pool initialized (max=%d)", config.max_agents)
 
@@ -190,24 +207,35 @@ class DaemonServer:
                 sender = msg.get("sender", "owner")
                 is_owner = msg.get("is_owner", True)
                 is_private = msg.get("is_private", True)
+                should_reply = msg.get("should_reply", True)
                 channel_id = msg.get("channel_id")
-                context = msg.get("context")
                 session_id = msg.get("session_id")
                 pid = provider_id or msg.get("provider_id")
 
                 if not pid:
                     logger.warning("User message from unregistered provider, ignoring")
-                elif is_private:
-                    await self._handle_private_message(
-                        content, pid, sender, is_owner,
-                        session_id=session_id,
-                    )
                 else:
-                    await self._handle_group_message(
-                        content, pid, sender, is_owner,
-                        channel_id=channel_id, context=context,
-                        session_id=session_id,
+                    # Unified flow: record to session first
+                    session_id = session_id or (
+                        f"dm:{pid}:{sender}" if is_private
+                        else f"group:{channel_id or 'unknown'}"
                     )
+                    session = self.session_manager.get_or_create(session_id)
+                    session.add_message("user", content, sender=sender)
+                    self.session_manager.save(session)
+
+                    if should_reply:
+                        if is_private:
+                            await self._handle_private_message(
+                                content, pid, sender, is_owner,
+                                session_id=session_id,
+                            )
+                        else:
+                            await self._handle_group_message(
+                                content, pid, sender, is_owner,
+                                channel_id=channel_id,
+                                session_id=session_id,
+                            )
 
             elif msg_type == MessageType.PING:
                 response = encode_message({"type": MessageType.PONG})
@@ -234,16 +262,26 @@ class DaemonServer:
         session_id: str,
         log_source: str,
         *,
+        profile: str = "private",
+        sdk_session_id: str | None = None,
         no_response_token: str | None = None,
         notify_heartbeat: bool = False,
     ):
-        """Shared message handler: acquire agent, run query, handle errors."""
+        """Shared message handler: acquire agent, run query, handle errors.
+
+        Args:
+            sdk_session_id: Session ID for the SDK agent. Defaults to session_id.
+                Use a unique value per query to disable SDK-level conversation history
+                (e.g. for group chat where we build context ourselves).
+        """
+        effective_sdk_session = sdk_session_id or session_id
         try:
-            agent = await self.agent_pool.get(session_id)
+            agent = await self.agent_pool.get(session_id, profile=profile)
             lock = self._get_session_lock(session_id)
             async with lock:
                 await self._run_agent_query(
                     agent, query, provider_id, session_id, log_source,
+                    sdk_session_id=effective_sdk_session,
                     no_response_token=no_response_token,
                 )
             if notify_heartbeat and self._heartbeat:
@@ -251,14 +289,14 @@ class DaemonServer:
             # Check if the agent requested a self-restart
             if consume_restart():
                 logger.info("[%s] agent requested restart — recreating", log_source)
-                await self.agent_pool.kill_and_recreate(session_id)
+                await self.agent_pool.kill_and_recreate(session_id, profile=profile)
         except AgentTimeoutError as e:
             logger.error("[%s] timeout: %s — recovering agent", log_source, e)
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
                 "content": "Agent response timeout, recovering...",
             })
-            await self.agent_pool.kill_and_recreate(session_id)
+            await self.agent_pool.kill_and_recreate(session_id, profile=profile)
         except Exception as e:
             logger.error("[%s] error: %s", log_source, e, exc_info=True)
             await self.gateway.send_to(provider_id, {
@@ -268,14 +306,9 @@ class DaemonServer:
 
     async def _handle_private_message(
         self, content: str, provider_id: str, sender: str, is_owner: bool,
-        *, session_id: str | None = None,
+        *, session_id: str,
     ):
         """Handle a private/DM message — routes to a per-session agent."""
-        session_id = session_id or f"dm:{provider_id}:{sender}"
-
-        session = self.session_manager.get_or_create(session_id)
-        session.add_message("user", content, sender=sender)
-        self.session_manager.save(session)
         logger.debug("[%s] %s", sender, truncate(content))
 
         query_content = content if is_owner else f"[{sender}]: {content}"
@@ -292,33 +325,34 @@ class DaemonServer:
         is_owner: bool,  # noqa: ARG002
         *,
         channel_id: str | None = None,
-        context: list[dict] | None = None,
-        session_id: str | None = None,
+        session_id: str,
     ):
-        """Handle a group chat message — routes to a per-channel agent."""
+        """Handle a group chat message — persistent agent with NO_RESPONSE support."""
         channel_label = channel_id or "unknown"
-        session_id = session_id or f"group:{channel_label}"
-        logger.debug("[group/%s] %s: %s", channel_label, sender, truncate(content))
+        log_source = f"group/{channel_label}"
+
+        # Build context from session history (the current message was already appended)
+        session = self.session_manager.get_or_create(session_id)
+        limit = get_config().group_context_limit
+        context_msgs = session.messages[-(limit + 1):-1] if len(session.messages) > 1 else []
 
         query_parts = []
-        if context:
+        if context_msgs:
             query_parts.append("[group chat context]")
-            for msg in context:
-                query_parts.append(f"{msg.get('sender', '?')}: {msg.get('content', '')}")
+            for msg in context_msgs:
+                msg_sender = msg.get("sender", msg.get("role", "?"))
+                query_parts.append(f"{msg_sender}: {msg.get('content', '')}")
             query_parts.append("")
+
         query_parts.append(f"[{sender}]: {content}")
         query_text = "\n".join(query_parts)
 
-        group_instruction = (
-            f"You are currently participating in a group chat (channel: {channel_label}).\n"
-            "You will receive recent conversation messages from the group. Please decide whether you need to participate in the conversation based on the content.\n"
-            "If the conversation doesn't require your participation, please only reply: NO_RESPONSE\n"
-            "If you need to reply, directly provide the content without adding any prefix.\n\n"
-        )
+        logger.debug("[%s] %s: %s", log_source, sender, query_text)
 
         await self._dispatch_to_agent(
-            group_instruction + query_text, provider_id, session_id,
-            f"group/{channel_label}",
+            query_text, provider_id, session_id, log_source,
+            profile="group",
+            sdk_session_id=uuid.uuid4().hex,
             no_response_token="NO_RESPONSE",
         )
 
@@ -333,8 +367,7 @@ class DaemonServer:
             config = get_config()
             self.agent_pool = AgentPool(
                 max_agents=config.max_agents,
-                include_schedule=True,
-                include_preset_tools=True,
+                profiles=_build_agent_profiles(),
             )
 
             logger.info("Reload complete — agent pool reset (max=%d)", config.max_agents)
@@ -363,6 +396,7 @@ class DaemonServer:
         session_id: str,
         log_source: str,
         *,
+        sdk_session_id: str | None = None,
         no_response_token: str | None = None,
     ):
         """Run an agent query and forward each step to the provider.
@@ -374,13 +408,14 @@ class DaemonServer:
         Guarantees that a done=True message is always sent, even on error.
         """
 
+        effective_sdk_session = sdk_session_id or session_id
         step = 0
         full_text = ""
         done_sent = False
 
         try:
             async for event in iter_response(
-                agent, query, session_id=session_id, log_source=log_source,
+                agent, query, session_id=effective_sdk_session, log_source=log_source,
             ):
                 if event.type == "tool":
                     await self.gateway.send_to(provider_id, {
@@ -433,7 +468,7 @@ class DaemonServer:
             )
             if not is_no_response:
                 session = self.session_manager.get_or_create(session_id)
-                session.add_message("assistant", full_text.strip())
+                session.add_message("<ASSISTANT>", full_text.strip())
                 self.session_manager.save(session)
 
     # ── Lifecycle ─────────────────────────────────────────────────
