@@ -30,6 +30,7 @@ from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
 from vtuber.session import SessionManager
 from vtuber.tools.schedule import set_scheduler, set_task_queue
+from vtuber.tools.lifecycle import consume_restart
 
 logger = logging.getLogger("vtuber.daemon")
 
@@ -247,11 +248,15 @@ class DaemonServer:
                 )
             if notify_heartbeat and self._heartbeat:
                 self._heartbeat.on_message()
+            # Check if the agent requested a self-restart
+            if consume_restart():
+                logger.info("[%s] agent requested restart — recreating", log_source)
+                await self.agent_pool.kill_and_recreate(session_id)
         except AgentTimeoutError as e:
             logger.error("[%s] timeout: %s — recovering agent", log_source, e)
             await self.gateway.send_to(provider_id, {
                 "type": MessageType.ERROR,
-                "content": "Agent 响应超时，正在恢复...",
+                "content": "Agent response timeout, recovering...",
             })
             await self.agent_pool.kill_and_recreate(session_id)
         except Exception as e:
@@ -297,7 +302,7 @@ class DaemonServer:
 
         query_parts = []
         if context:
-            query_parts.append("[群聊上下文]")
+            query_parts.append("[group chat context]")
             for msg in context:
                 query_parts.append(f"{msg.get('sender', '?')}: {msg.get('content', '')}")
             query_parts.append("")
@@ -305,10 +310,10 @@ class DaemonServer:
         query_text = "\n".join(query_parts)
 
         group_instruction = (
-            f"你正在参与一个群聊（频道: {channel_label}）。\n"
-            "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
-            "如果对话不需要你参与，请只回复: NO_RESPONSE\n"
-            "如果需要回复，直接回复内容即可，不要加任何前缀。\n\n"
+            f"You are currently participating in a group chat (channel: {channel_label}).\n"
+            "You will receive recent conversation messages from the group. Please decide whether you need to participate in the conversation based on the content.\n"
+            "If the conversation doesn't require your participation, please only reply: NO_RESPONSE\n"
+            "If you need to reply, directly provide the content without adding any prefix.\n\n"
         )
 
         await self._dispatch_to_agent(

@@ -1,7 +1,7 @@
 """Schedule tools using APScheduler for precise task execution."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from claude_agent_sdk import tool
@@ -105,7 +105,7 @@ async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if offset is not None:
-            run_date = datetime.now(timezone.utc) + timedelta(seconds=int(offset))
+            run_date = datetime.now().astimezone() + timedelta(seconds=int(offset))
             _scheduler.scheduler.add_job(
                 func=scheduled_job_handler,
                 trigger="date",

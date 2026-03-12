@@ -26,8 +26,9 @@ def create_tools_server(include_schedule: bool = True):
     """
     from vtuber.tools.memory import search_sessions, list_sessions, read_session
     from vtuber.tools.web import web_search, web_fetch
+    from vtuber.tools.lifecycle import agent_restart
 
-    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch]
+    tools = [search_sessions, list_sessions, read_session, web_search, web_fetch, agent_restart]
 
     if include_schedule:
         from vtuber.tools.schedule import schedule_create, schedule_list, schedule_cancel
@@ -43,7 +44,7 @@ def build_agent_options(
     *,
     system_prompt: str | None = None,
     prompt_suffix: str = "",
-    include_preset_system_prompt: bool = True,
+    include_preset_system_prompt: bool = False,
     include_schedule: bool = False,
     include_mcp_tools: bool = True,
     include_preset_tools: bool = False,
