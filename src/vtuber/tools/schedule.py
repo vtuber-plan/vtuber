@@ -7,6 +7,8 @@ from typing import Any
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
+from vtuber.tools._helpers import error_response, text_response
+
 # Injected by daemon on startup
 _scheduler = None
 _task_queue: asyncio.Queue | None = None
@@ -33,14 +35,6 @@ async def scheduled_job_handler(task: str = "", deliver: bool = True):
     """
     if _task_queue and task:
         await _task_queue.put({"task": task, "deliver": deliver})
-
-
-def _text(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
-
-
-def _error(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": f"Error: {text}"}], "is_error": True}
 
 
 @tool(
@@ -90,7 +84,7 @@ def _error(text: str) -> dict[str, Any]:
 async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
     """Create a scheduled task."""
     if _scheduler is None:
-        return _error("Scheduler not initialized. Daemon must be running.")
+        return error_response("Scheduler not initialized. Daemon must be running.")
 
     task_id = args["task_id"]
     task_prompt = args["task"]
@@ -105,7 +99,7 @@ async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
     # Exactly one scheduling mode must be provided
     modes = sum(x is not None for x in (offset, at, every, cron_expr))
     if modes != 1:
-        return _error("Provide exactly one of: offset_seconds, at, every_seconds, cron")
+        return error_response("Provide exactly one of: offset_seconds, at, every_seconds, cron")
 
     job_kwargs = {"task": task_prompt, "deliver": deliver}
 
@@ -164,10 +158,10 @@ async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
             if job and job.next_run_time
             else "pending"
         )
-        return _text(f"Scheduled '{task_id}': {task_prompt} (next run: {next_run})")
+        return text_response(f"Scheduled '{task_id}': {task_prompt} (next run: {next_run})")
 
     except Exception as e:
-        return _error(f"Failed to create task: {e}")
+        return error_response(f"Failed to create task: {e}")
 
 
 @tool(
@@ -182,11 +176,11 @@ async def schedule_create(args: dict[str, Any]) -> dict[str, Any]:
 async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
     """List all scheduled tasks."""
     if _scheduler is None:
-        return _error("Scheduler not initialized. Daemon must be running.")
+        return error_response("Scheduler not initialized. Daemon must be running.")
 
     jobs = _scheduler.scheduler.get_jobs()
     if not jobs:
-        return _text("No scheduled tasks.")
+        return text_response("No scheduled tasks.")
 
     lines = ["Scheduled tasks:"]
     for job in jobs:
@@ -194,7 +188,7 @@ async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
         task_desc = job.kwargs.get("task", "N/A") if job.kwargs else "N/A"
         lines.append(f"- {job.id}: {task_desc} (next: {next_run})")
 
-    return _text("\n".join(lines))
+    return text_response("\n".join(lines))
 
 
 @tool(
@@ -212,11 +206,11 @@ async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
 async def schedule_cancel(args: dict[str, Any]) -> dict[str, Any]:
     """Cancel a scheduled task."""
     if _scheduler is None:
-        return _error("Scheduler not initialized. Daemon must be running.")
+        return error_response("Scheduler not initialized. Daemon must be running.")
 
     task_id = args["task_id"]
     try:
         _scheduler.scheduler.remove_job(task_id)
-        return _text(f"Cancelled task '{task_id}'")
+        return text_response(f"Cancelled task '{task_id}'")
     except Exception:
-        return _error(f"Task '{task_id}' not found or already completed")
+        return error_response(f"Task '{task_id}' not found or already completed")

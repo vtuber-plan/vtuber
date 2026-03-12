@@ -328,23 +328,6 @@ class OneBotProvider(Provider):
                     "message": text,
                 })
 
-    # ── Abstract method stubs (unused — _dispatch is overridden) ──
-
-    async def on_response(self, content: str, *, done: bool) -> None:
-        pass
-
-    async def on_progress(self, tool: str) -> None:
-        pass
-
-    async def on_error(self, error: str) -> None:
-        pass
-
-    async def on_heartbeat(self, content: str) -> None:
-        pass
-
-    async def on_task(self, content: str, task: str, *, done: bool) -> None:
-        pass
-
     async def on_disconnected(self) -> None:
         """Handle daemon disconnection."""
         logger.warning("Daemon connection lost")

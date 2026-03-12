@@ -14,13 +14,14 @@ from vtuber.config import (
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.agent_query import iter_oneshot, truncate
+from vtuber.daemon.agent_query import collect_oneshot, truncate
 from vtuber.templates import DEFAULT_HEARTBEAT
 
 logger = logging.getLogger("vtuber.daemon")
 
 
-# Heartbeat tool definition (from nanobot)
+# ── Virtual tool definitions ─────────────────────────────────────
+
 _HEARTBEAT_TOOL = [
     {
         "type": "function",
@@ -46,8 +47,6 @@ _HEARTBEAT_TOOL = [
     }
 ]
 
-
-# Save memory tool definition (from nanobot)
 _SAVE_MEMORY_TOOL = [
     {
         "type": "function",
@@ -73,6 +72,45 @@ _SAVE_MEMORY_TOOL = [
         },
     }
 ]
+
+
+# ── Shared tool-call extraction ──────────────────────────────────
+
+
+async def _extract_tool_call(
+    prompt: str,
+    system_prompt: str,
+    tools: list[dict],
+    tool_name: str,
+    log_label: str,
+) -> dict | None:
+    """Run a one-shot LLM query with forced tool use and extract the tool arguments.
+
+    Returns the tool input dict, or None if the LLM didn't call the expected tool.
+    """
+    from claude_agent_sdk import query as sdk_query
+    from claude_agent_sdk.types import AssistantMessage, ClaudeAgentOptions, ToolUseBlock
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        tools=tools,
+        tool_choice={"type": "tool", "name": tool_name},
+    )
+
+    try:
+        async for msg in sdk_query(prompt=prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, ToolUseBlock) and block.name == tool_name:
+                        return block.input
+    except Exception as e:
+        logger.error("[%s] tool call extraction error: %s", log_label, e, exc_info=True)
+
+    logger.warning("[%s] LLM did not call %s tool", log_label, tool_name)
+    return None
+
+
+# ── HeartbeatManager ─────────────────────────────────────────────
 
 
 class HeartbeatManager:
@@ -118,51 +156,6 @@ class HeartbeatManager:
             except Exception as e:
                 logger.error("Heartbeat error: %s", e, exc_info=True)
 
-    async def _decide(self, heartbeat_content: str) -> tuple[str, str]:
-        """Phase 1: ask LLM to decide skip/run via virtual tool call.
-
-        Returns (action, tasks) where action is 'skip' or 'run'.
-        """
-        from claude_agent_sdk import query as sdk_query
-        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
-
-        options = build_agent_options(
-            system_prompt="You are a heartbeat agent. Call the heartbeat tool to report your decision.",
-            tools=_HEARTBEAT_TOOL,
-            tool_choice={"type": "tool", "name": "heartbeat"},
-            include_mcp_tools=False,
-            include_preset_tools=False,
-            include_schedule=False,
-        )
-
-        prompt = (
-            "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
-            f"{heartbeat_content}"
-        )
-
-        # Collect tool call from AssistantMessage
-        tool_args = None
-        try:
-            async for msg in sdk_query(prompt=prompt, options=options):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, ToolUseBlock) and block.name == "heartbeat":
-                            tool_args = block.input
-                            break
-                    if tool_args:
-                        break
-        except Exception as e:
-            logger.error("[heartbeat] decision phase error: %s", e, exc_info=True)
-            return "skip", ""
-
-        if not tool_args:
-            logger.warning("[heartbeat] no tool call found, defaulting to skip")
-            return "skip", ""
-
-        action = tool_args.get("action", "skip")
-        tasks = tool_args.get("tasks", "")
-        return action, tasks
-
     async def _execute_heartbeat(self):
         """Two-phase heartbeat: decision via tool call, then optional execution."""
         heartbeat_path = get_heartbeat_path()
@@ -179,30 +172,33 @@ class HeartbeatManager:
 
         try:
             # Phase 1: Decision
-            action, tasks = await self._decide(heartbeat_content)
+            tool_args = await _extract_tool_call(
+                prompt=f"Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n{heartbeat_content}",
+                system_prompt="You are a heartbeat agent. Call the heartbeat tool to report your decision.",
+                tools=_HEARTBEAT_TOOL,
+                tool_name="heartbeat",
+                log_label="heartbeat",
+            )
 
-            if action != "run":
+            if not tool_args or tool_args.get("action") != "run":
                 logger.info("[heartbeat] OK (nothing to report)")
                 return
+
+            tasks = tool_args.get("tasks", "")
 
             # Phase 2: Execution
             logger.info("[heartbeat] tasks found, executing...")
             options = build_agent_options(
-                prompt_suffix=(
-                    "[HEARTBEAT] 请执行以下任务并报告结果。"
-                ),
+                prompt_suffix="[HEARTBEAT] 请执行以下任务并报告结果。",
                 include_schedule=True,
                 include_preset_tools=True,
             )
 
-            collected = ""
-            async for event in iter_oneshot(
+            collected = await collect_oneshot(
                 f"[Heartbeat Tasks]\n\n{tasks}",
                 options,
                 log_source="heartbeat",
-            ):
-                if event.type == "text":
-                    collected += event.text
+            )
 
             if collected.strip():
                 logger.info("[heartbeat] agent responded: %s", truncate(collected))
@@ -218,16 +214,13 @@ class HeartbeatManager:
 
     async def _consolidate(self):
         """Auto-consolidate all sessions with enough unconsolidated messages."""
-        from vtuber.config import get_sessions_dir
-        from vtuber.tools.memory import SessionManager
+        from vtuber.session import SessionManager
 
         self._consolidation_running = True
         try:
-            sessions_dir = get_sessions_dir()
-            manager = SessionManager(sessions_dir)
-
-            # Find sessions that need consolidation
+            manager = SessionManager(get_sessions_dir())
             keep_count = get_config().consolidation_keep_count
+
             for info in manager.list_sessions():
                 session_key = info.get("key")
                 if not session_key:
@@ -253,15 +246,8 @@ class HeartbeatManager:
             self._consolidation_running = False
             self.message_count = 0
 
-    async def _consolidate_session(
-        self,
-        manager,
-        session,
-        old_messages: list[dict],
-        keep_count: int,
-    ):
+    async def _consolidate_session(self, manager, session, old_messages: list[dict], keep_count: int):
         """Consolidate a single session's old messages into MEMORY.md + HISTORY.md."""
-        # Build transcript
         lines = []
         for m in old_messages:
             if not m.get("content"):
@@ -287,40 +273,18 @@ class HeartbeatManager:
 ## Conversation to Process (session: {session.key})
 {chr(10).join(lines)}"""
 
-        # Call LLM with save_memory tool
-        from claude_agent_sdk import query as sdk_query
-        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
-
-        options = build_agent_options(
+        tool_args = await _extract_tool_call(
+            prompt=prompt,
             system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
             tools=_SAVE_MEMORY_TOOL,
-            tool_choice={"type": "tool", "name": "save_memory"},
-            include_mcp_tools=False,
-            include_preset_tools=False,
-            include_schedule=False,
+            tool_name="save_memory",
+            log_label=f"consolidation/{session.key}",
         )
 
-        tool_args = None
-        try:
-            async for msg in sdk_query(prompt=prompt, options=options):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, ToolUseBlock) and block.name == "save_memory":
-                            tool_args = block.input
-                            break
-                    if tool_args:
-                        break
-        except Exception as e:
-            logger.error("[consolidation] session %s error: %s", session.key, e, exc_info=True)
-            return
-
         if not tool_args:
-            logger.warning("[consolidation] session %s: LLM did not call save_memory tool", session.key)
             return
 
-        # Process results
-        from vtuber.config import get_history_path
-
+        # Write history entry
         if entry := tool_args.get("history_entry"):
             if not isinstance(entry, str):
                 entry = json.dumps(entry, ensure_ascii=False)
@@ -328,6 +292,7 @@ class HeartbeatManager:
             with open(history_path, "a", encoding="utf-8") as f:
                 f.write(entry.rstrip() + "\n\n")
 
+        # Update long-term memory
         if update := tool_args.get("memory_update"):
             if not isinstance(update, str):
                 update = json.dumps(update, ensure_ascii=False)

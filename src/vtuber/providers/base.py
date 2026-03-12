@@ -89,21 +89,7 @@ class Provider(ABC):
         session_id: str | None = None,
         context: list[ChatMessage] | None = None,
     ) -> None:
-        """Send a user message to the daemon.
-
-        Args:
-            content: The message text.
-            sender: Display name of the message sender.
-            is_owner: Whether the sender is the agent's primary user.
-            is_private: True for DM/CLI, False for group chats.
-            channel_id: Unique channel identifier for group chats.
-            session_id: Explicit session identifier. If provided, overrides
-                the default session routing. Providers should use this to
-                isolate conversations — e.g. per-user DMs or per-channel
-                group chats. If omitted, the daemon derives a session_id
-                from provider_id + sender (private) or channel_id (group).
-            context: Recent conversation context (for group chats).
-        """
+        """Send a user message to the daemon."""
         msg: dict = {
             "type": MessageType.USER_MESSAGE,
             "content": content,
@@ -183,50 +169,31 @@ class Provider(ABC):
         elif msg_type == MessageType.PONG:
             pass  # silently ignore
 
-    # ── Platform Callbacks (subclasses implement) ────────────────
+    # ── Platform Callbacks ────────────────────────────────────────
+    # Default implementations are no-ops. Subclasses override as needed.
 
-    @abstractmethod
     async def on_response(self, content: str, *, done: bool) -> None:
-        """Handle assistant response segment.
+        """Handle assistant response segment."""
+        pass
 
-        Each call carries a complete, displayable text segment.
-
-        Args:
-            content: Text content (may be empty on the final signal).
-            done: False = display this segment, keep waiting for more.
-                  True  = response complete, stop waiting.
-        """
-        ...
-
-    @abstractmethod
     async def on_progress(self, tool: str) -> None:
         """Handle progress update (agent is using a tool)."""
-        ...
+        pass
 
-    @abstractmethod
     async def on_error(self, error: str) -> None:
         """Handle error from daemon."""
-        ...
+        pass
 
-    @abstractmethod
     async def on_heartbeat(self, content: str) -> None:
-        """Handle heartbeat message from agent (always a single complete message)."""
-        ...
+        """Handle heartbeat message from agent."""
+        pass
 
-    @abstractmethod
     async def on_task(self, content: str, task: str, *, done: bool) -> None:
-        """Handle scheduled task result.
-
-        Args:
-            content: Text content (may be empty on the final signal).
-            task: The task description.
-            done: False = display this segment, keep waiting.
-                  True  = task complete, stop waiting.
-        """
-        ...
+        """Handle scheduled task result."""
+        pass
 
     async def on_disconnected(self) -> None:
-        """Called when daemon connection is lost. Override for custom handling."""
+        """Called when daemon connection is lost."""
         pass
 
     # ── Main Loop ────────────────────────────────────────────────
@@ -238,12 +205,7 @@ class Provider(ABC):
 
 
 class QueuedProvider(Provider):
-    """Provider that queues incoming daemon messages for the main loop.
-
-    Most terminal/chat providers share the same pattern: queue messages
-    from the daemon and consume them in the main loop. This base class
-    provides the common callback implementations.
-    """
+    """Provider that queues incoming daemon messages for the main loop."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -275,6 +237,3 @@ class QueuedProvider(Provider):
             "task": task,
             "done": done,
         })
-
-    async def on_disconnected(self) -> None:
-        pass

@@ -1,167 +1,13 @@
-"""Memory system — short-term session logs + long-term persistent memory."""
+"""Memory tools — MCP tools for searching and reading conversation sessions."""
 
-import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
 from vtuber.config import get_sessions_dir
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Session:
-    """
-    A conversation session.
-
-    Stores messages in JSONL format for easy persistence.
-    Messages are append-only for LLM cache efficiency.
-    """
-
-    key: str  # channel:chat_id (e.g., "cli:main", "discord:user_123")
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated
-
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            **kwargs
-        }
-        self.messages.append(msg)
-        self.updated_at = datetime.now()
-
-
-class SessionManager:
-    """
-    Manages conversation sessions.
-
-    Sessions are stored as JSONL files in the sessions directory.
-    """
-
-    def __init__(self, sessions_dir: Path):
-        self.sessions_dir = sessions_dir
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self._cache: dict[str, Session] = {}
-
-    def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
-        safe_key = _safe_filename(key)
-        return self.sessions_dir / f"{safe_key}.jsonl"
-
-    def get_or_create(self, key: str) -> Session:
-        """Get an existing session or create a new one."""
-        if key in self._cache:
-            return self._cache[key]
-
-        session = self._load(key)
-        if session is None:
-            session = Session(key=key)
-
-        self._cache[key] = session
-        return session
-
-    def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
-        path = self._get_session_path(key)
-        if not path.exists():
-            return None
-
-        try:
-            messages = []
-            metadata = {}
-            created_at = None
-            last_consolidated = 0
-
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    data = json.loads(line)
-
-                    if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
-                    else:
-                        messages.append(data)
-
-            return Session(
-                key=key,
-                messages=messages,
-                created_at=created_at or datetime.now(),
-                metadata=metadata,
-                last_consolidated=last_consolidated
-            )
-        except Exception as e:
-            logger.error(f"Failed to load session {key}: {e}")
-            return None
-
-    def save(self, session: Session) -> None:
-        """Save a session to disk."""
-        path = self._get_session_path(session.key)
-
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
-        self._cache[session.key] = session
-
-    def list_sessions(self) -> list[dict[str, Any]]:
-        """List all sessions."""
-        sessions = []
-
-        for path in self.sessions_dir.glob("*.jsonl"):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
-            except Exception:
-                continue
-
-        return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
-
-
-# --- Helper functions ---
-
-
-def _safe_filename(key: str) -> str:
-    """Convert session key to safe filename."""
-    return key.replace(":", "_").replace("/", "_")
-
-
-# --- Tools for the AI ---
+from vtuber.session import SessionManager
+from vtuber.tools._helpers import text_response
 
 
 @tool(
@@ -207,7 +53,7 @@ def _search_history(query: str, limit: int) -> dict[str, Any]:
 
     history_path = get_history_path()
     if not history_path.exists():
-        return {"content": [{"type": "text", "text": "No history found (HISTORY.md does not exist)."}]}
+        return text_response("No history found (HISTORY.md does not exist).")
 
     text = history_path.read_text(encoding="utf-8")
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -220,15 +66,14 @@ def _search_history(query: str, limit: int) -> dict[str, Any]:
                 break
 
     if not results:
-        return {"content": [{"type": "text", "text": f"No matches found for '{query}' in history summaries."}]}
+        return text_response(f"No matches found for '{query}' in history summaries.")
 
-    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
+    return text_response("\n\n---\n\n".join(results))
 
 
 def _search_sessions_detailed(query: str, limit: int) -> dict[str, Any]:
     """Search raw session logs for matching messages with context."""
-    sessions_dir = get_sessions_dir()
-    manager = SessionManager(sessions_dir)
+    manager = SessionManager(get_sessions_dir())
     results = []
 
     for session_info in manager.list_sessions():
@@ -239,7 +84,6 @@ def _search_sessions_detailed(query: str, limit: int) -> dict[str, Any]:
             if query not in content.lower():
                 continue
 
-            # Include surrounding context
             context_lines = []
             if i > 0:
                 prev = session.messages[i - 1]
@@ -259,9 +103,9 @@ def _search_sessions_detailed(query: str, limit: int) -> dict[str, Any]:
             break
 
     if not results:
-        return {"content": [{"type": "text", "text": f"No matches found for '{query}' in session logs."}]}
+        return text_response(f"No matches found for '{query}' in session logs.")
 
-    return {"content": [{"type": "text", "text": "\n\n---\n\n".join(results)}]}
+    return text_response("\n\n---\n\n".join(results))
 
 
 @tool(
@@ -282,20 +126,18 @@ def _search_sessions_detailed(query: str, limit: int) -> dict[str, Any]:
 async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
     """List recent conversation sessions with previews."""
     limit = args.get("limit", 10)
-    sessions_dir = get_sessions_dir()
 
-    manager = SessionManager(sessions_dir)
+    manager = SessionManager(get_sessions_dir())
     sessions = manager.list_sessions()[:limit]
 
     if not sessions:
-        return {"content": [{"type": "text", "text": "No session logs found."}]}
+        return text_response("No session logs found.")
 
     lines = ["Recent sessions:\n"]
     for session_info in sessions:
         session = manager.get_or_create(session_info["key"])
         user_count = sum(1 for m in session.messages if m.get("role") == "user")
 
-        # Build preview from first user messages
         topics = []
         for m in session.messages:
             if m.get("role") == "user":
@@ -308,7 +150,7 @@ async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
 
         lines.append(f"- **{session.key}** ({len(session.messages)} msgs, {user_count} from user): {preview}")
 
-    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+    return text_response("\n".join(lines))
 
 
 @tool(
@@ -329,13 +171,12 @@ async def list_sessions(args: dict[str, Any]) -> dict[str, Any]:
 async def read_session(args: dict[str, Any]) -> dict[str, Any]:
     """Read a specific session's full conversation."""
     session_id = args["session_id"]
-    sessions_dir = get_sessions_dir()
 
-    manager = SessionManager(sessions_dir)
+    manager = SessionManager(get_sessions_dir())
     session = manager.get_or_create(session_id)
 
     if not session.messages:
-        return {"content": [{"type": "text", "text": f"Session '{session_id}' is empty or not found."}]}
+        return text_response(f"Session '{session_id}' is empty or not found.")
 
     lines = [f"Session: {session_id} ({len(session.messages)} messages)\n"]
     for entry in session.messages:
@@ -343,5 +184,4 @@ async def read_session(args: dict[str, Any]) -> dict[str, Any]:
         role = entry.get("role", "?")
         content = entry.get("content", "")
         lines.append(f"[{ts}] **{role}**: {content}")
-    return {"content": [{"type": "text", "text": "\n\n".join(lines)}]}
-
+    return text_response("\n\n".join(lines))

@@ -15,15 +15,14 @@ from claude_agent_sdk.types import (
     ClaudeAgentOptions,
     PermissionResultAllow,
     PermissionResultDeny,
-    ResultMessage,
     ToolPermissionContext,
 )
 
 import shutil
 
 from vtuber.config import ensure_config_dir, get_config_path, get_persona_path, get_user_path, get_heartbeat_path, ensure_workspace_dir, ensure_plugins_dir, migrate_config, generate_config_yaml
+from vtuber.daemon.agent_query import collect_response
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER, DEFAULT_HEARTBEAT
-from vtuber.utils import extract_stream_text
 
 console = Console()
 prompt_session = PromptSession()
@@ -97,15 +96,8 @@ ONBOARDING_SYSTEM_PROMPT = """你是 VTuber 数字生命助手的初次设置引
 async def _query_and_collect(
     agent: ClaudeSDKClient, prompt: str, print_stream: bool = True
 ) -> str:
-    """Send a query to the agent and collect the full text response."""
-    await agent.query(prompt)
-    collected = ""
-    async for msg in agent.receive_response():
-        text = extract_stream_text(msg)
-        if text:
-            collected += text
-        elif isinstance(msg, ResultMessage):
-            break
+    """Send a query to the agent, collect text, and optionally print it."""
+    collected = await collect_response(agent, prompt, log_source="onboarding")
     if print_stream and collected.strip():
         console.print()
         console.print(

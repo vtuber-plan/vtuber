@@ -8,6 +8,7 @@ from claude_agent_sdk import tool
 from mcp.types import ToolAnnotations
 
 from vtuber.config import get_config
+from vtuber.tools._helpers import text_response
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
     """Search the web via Tavily API."""
     api_key = get_config().tavily_api_key
     if not api_key:
-        return _text(
+        return text_response(
             "Error: tavily_api_key is not configured. "
             "Add it to ~/.vtuber/config.yaml (get one at https://tavily.com)"
         )
@@ -64,15 +65,15 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as e:
-        return _text(f"Search API error: HTTP {e.response.status_code}")
+        return text_response(f"Search API error: HTTP {e.response.status_code}")
     except httpx.RequestError as e:
-        return _text(f"Search request failed: {e}")
+        return text_response(f"Search request failed: {e}")
     except Exception as e:
-        return _text(f"Search error: {e}")
+        return text_response(f"Search error: {e}")
 
     results = data.get("results", [])
     if not results:
-        return _text(f"No results found for '{query}'.")
+        return text_response(f"No results found for '{query}'.")
 
     lines = []
     for i, r in enumerate(results, 1):
@@ -81,7 +82,7 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
         snippet = r.get("content", "").strip()
         lines.append(f"{i}. **{title}**\n   URL: {url}\n   {snippet}")
 
-    return _text("\n\n".join(lines))
+    return text_response("\n\n".join(lines))
 
 
 @tool(
@@ -118,7 +119,7 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
     limit = max(args.get("limit", _DEFAULT_READ_LENGTH) or _DEFAULT_READ_LENGTH, 1)
 
     if not url.startswith(("http://", "https://")):
-        return _text("Error: URL must start with http:// or https://")
+        return text_response("Error: URL must start with http:// or https://")
 
     try:
         async with httpx.AsyncClient(
@@ -129,15 +130,15 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
             resp = await client.get(url)
             resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return _text(f"Fetch error: HTTP {e.response.status_code}")
+        return text_response(f"Fetch error: HTTP {e.response.status_code}")
     except httpx.RequestError as e:
-        return _text(f"Fetch request failed: {e}")
+        return text_response(f"Fetch request failed: {e}")
     except Exception as e:
-        return _text(f"Fetch error: {e}")
+        return text_response(f"Fetch error: {e}")
 
     content_type = resp.headers.get("content-type", "")
     if not any(t in content_type for t in ("text/html", "text/plain", "application/json")):
-        return _text(f"Unsupported content type: {content_type}")
+        return text_response(f"Unsupported content type: {content_type}")
 
     html = resp.text
 
@@ -162,9 +163,4 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
         header += f" | {remaining} chars remaining (use offset={offset + len(chunk)} to continue)"
     header += "\n\n"
 
-    return _text(f"{header}{extraction_note}{chunk}")
-
-
-def _text(text: str) -> dict[str, Any]:
-    """Helper to build a text content response."""
-    return {"content": [{"type": "text", "text": text}]}
+    return text_response(f"{header}{extraction_note}{chunk}")

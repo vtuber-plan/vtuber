@@ -1,4 +1,4 @@
-from vtuber.tools.memory import Session
+from vtuber.session import Session
 from datetime import datetime
 
 

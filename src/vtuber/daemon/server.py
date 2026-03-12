@@ -6,10 +6,7 @@ import logging
 import os
 import signal
 import sys
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
-from rich.logging import RichHandler
 
 from claude_agent_sdk import ClaudeSDKClient
 
@@ -18,7 +15,6 @@ from vtuber.config import (
     ensure_workspace_dir,
     get_config,
     get_db_path,
-    get_log_path,
     get_pid_path,
     get_socket_path,
     get_sessions_dir,
@@ -32,41 +28,10 @@ from vtuber.daemon.protocol import MessageType, decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
 from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
-from vtuber.tools.memory import SessionManager
+from vtuber.session import SessionManager
 from vtuber.tools.schedule import set_scheduler, set_task_queue
 
 logger = logging.getLogger("vtuber.daemon")
-
-
-def setup_logging():
-    """Configure logging to ~/.vtuber/daemon.log with rotation."""
-    ensure_config_dir()
-    log_path = get_log_path()
-
-    handler = RotatingFileHandler(
-        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-
-    root = logging.getLogger("vtuber")
-    level = getattr(logging, get_config().log_level, logging.INFO)
-    root.setLevel(level)
-    root.addHandler(handler)
-
-    # Also log to stderr when running in foreground
-    if sys.stderr and sys.stderr.isatty():
-        console_handler = RichHandler(
-            rich_tracebacks=True,
-            show_path=False,
-            markup=True,
-        )
-        console_handler.setLevel(level)
-        root.addHandler(console_handler)
 
 
 class DaemonServer:
@@ -261,13 +226,46 @@ class DaemonServer:
 
     # ── Message handlers ──────────────────────────────────────────
 
+    async def _dispatch_to_agent(
+        self,
+        query: str,
+        provider_id: str,
+        session_id: str,
+        log_source: str,
+        *,
+        no_response_token: str | None = None,
+        notify_heartbeat: bool = False,
+    ):
+        """Shared message handler: acquire agent, run query, handle errors."""
+        try:
+            agent = await self.agent_pool.get(session_id)
+            lock = self._get_session_lock(session_id)
+            async with lock:
+                await self._run_agent_query(
+                    agent, query, provider_id, session_id, log_source,
+                    no_response_token=no_response_token,
+                )
+            if notify_heartbeat and self._heartbeat:
+                self._heartbeat.on_message()
+        except AgentTimeoutError as e:
+            logger.error("[%s] timeout: %s — recovering agent", log_source, e)
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": "Agent 响应超时，正在恢复...",
+            })
+            await self.agent_pool.kill_and_recreate(session_id)
+        except Exception as e:
+            logger.error("[%s] error: %s", log_source, e, exc_info=True)
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": str(e),
+            })
+
     async def _handle_private_message(
         self, content: str, provider_id: str, sender: str, is_owner: bool,
         *, session_id: str | None = None,
     ):
         """Handle a private/DM message — routes to a per-session agent."""
-        # Use explicit session_id, or derive from provider + sender.
-        # Each distinct sender gets their own session even within the same provider.
         session_id = session_id or f"dm:{provider_id}:{sender}"
 
         session = self.session_manager.get_or_create(session_id)
@@ -276,29 +274,10 @@ class DaemonServer:
         logger.debug("[%s] %s", sender, truncate(content))
 
         query_content = content if is_owner else f"[{sender}]: {content}"
-
-        try:
-            agent = await self.agent_pool.get(session_id)
-            lock = self._get_session_lock(session_id)
-            async with lock:
-                await self._run_agent_query(
-                    agent, query_content, provider_id, session_id, "agent",
-                )
-            if self._heartbeat:
-                self._heartbeat.on_message()
-        except AgentTimeoutError as e:
-            logger.error("[agent] timeout: %s — recovering agent", e)
-            await self.gateway.send_to(provider_id, {
-                "type": MessageType.ERROR,
-                "content": "Agent 响应超时，正在恢复...",
-            })
-            await self.agent_pool.kill_and_recreate(session_id)
-        except Exception as e:
-            logger.error("[agent] error handling message: %s", e, exc_info=True)
-            await self.gateway.send_to(provider_id, {
-                "type": MessageType.ERROR,
-                "content": str(e),
-            })
+        await self._dispatch_to_agent(
+            query_content, provider_id, session_id, "agent",
+            notify_heartbeat=True,
+        )
 
     async def _handle_group_message(
         self,
@@ -313,8 +292,6 @@ class DaemonServer:
     ):
         """Handle a group chat message — routes to a per-channel agent."""
         channel_label = channel_id or "unknown"
-        # Use explicit session_id, or derive from channel.
-        # Each distinct channel gets its own session.
         session_id = session_id or f"group:{channel_label}"
         logger.debug("[group/%s] %s: %s", channel_label, sender, truncate(content))
 
@@ -327,7 +304,6 @@ class DaemonServer:
         query_parts.append(f"[{sender}]: {content}")
         query_text = "\n".join(query_parts)
 
-        # Prepend group chat instruction for this session
         group_instruction = (
             f"你正在参与一个群聊（频道: {channel_label}）。\n"
             "你会收到群里最近的对话消息。请根据对话内容决定是否需要回复。\n"
@@ -335,24 +311,11 @@ class DaemonServer:
             "如果需要回复，直接回复内容即可，不要加任何前缀。\n\n"
         )
 
-        try:
-            agent = await self.agent_pool.get(session_id)
-            lock = self._get_session_lock(session_id)
-            async with lock:
-                await self._run_agent_query(
-                    agent, group_instruction + query_text, provider_id, session_id,
-                    f"group/{channel_label}",
-                    no_response_token="NO_RESPONSE",
-                )
-        except AgentTimeoutError as e:
-            logger.error("[group/%s] timeout: %s — recovering agent", channel_label, e)
-            await self.agent_pool.kill_and_recreate(session_id)
-        except Exception as e:
-            logger.error("[group/%s] error: %s", channel_label, e, exc_info=True)
-            await self.gateway.send_to(provider_id, {
-                "type": MessageType.ERROR,
-                "content": str(e),
-            })
+        await self._dispatch_to_agent(
+            group_instruction + query_text, provider_id, session_id,
+            f"group/{channel_label}",
+            no_response_token="NO_RESPONSE",
+        )
 
     async def _handle_reload(self, writer: asyncio.StreamWriter) -> None:
         """Reload agents with fresh prompts (hot-reload)."""
@@ -532,144 +495,10 @@ class DaemonServer:
 # ── Daemon CLI helpers ────────────────────────────────────────────
 
 
-def start_daemon_background():
-    """Start the daemon in background mode."""
-    import subprocess
-
-    socket_path = get_socket_path()
-    pid_path = get_pid_path()
-
-    # Check if daemon is already running
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)
-            print(f"Daemon is already running (PID: {pid})")
-            return
-        except (OSError, ProcessLookupError):
-            pid_path.unlink()
-            if socket_path.exists():
-                socket_path.unlink()
-
-    # Run onboarding interactively before starting background daemon
-    from vtuber.onboarding import check_and_run_onboarding
-
-    try:
-        onboarded = asyncio.run(check_and_run_onboarding())
-        if onboarded:
-            print("Onboarding completed")
-    except Exception as e:
-        print(f"Onboarding check failed: {e}")
-        print("Continuing with default configuration...")
-        from vtuber.onboarding import create_default_configs
-        create_default_configs()
-
-    # Start daemon in background
-    try:
-        ensure_config_dir()
-        log_path = get_log_path()
-        log_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
-
-        subprocess.Popen(
-            [sys.executable, "-m", "vtuber.daemon.server"],
-            stdout=log_file,
-            stderr=log_file,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log_file.close()
-        print("Daemon started in background")
-        print(f"Log: {log_path}")
-
-        import time
-        time.sleep(1)
-
-        if pid_path.exists():
-            pid = int(pid_path.read_text().strip())
-            print(f"Daemon running with PID: {pid}")
-        else:
-            print("Warning: Daemon may have failed to start (no PID file)")
-
-    except Exception as e:
-        print(f"Error starting daemon: {e}")
-        sys.exit(1)
-
-
-def stop_daemon():
-    """Stop the running daemon."""
-    pid_path = get_pid_path()
-
-    if not pid_path.exists():
-        print("Daemon is not running (no PID file)")
-        return
-
-    try:
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
-
-        import time
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                time.sleep(1)
-            except ProcessLookupError:
-                print(f"Daemon stopped (PID: {pid})")
-                return
-
-        print("Daemon did not stop gracefully, forcing...")
-        os.kill(pid, signal.SIGKILL)
-        print(f"Daemon killed (PID: {pid})")
-
-    except ProcessLookupError:
-        print("Daemon is not running (process not found)")
-        pid_path.unlink()
-    except Exception as e:
-        print(f"Error stopping daemon: {e}")
-
-
-def check_status():
-    """Check if the daemon is running."""
-    socket_path = get_socket_path()
-    pid_path = get_pid_path()
-
-    if not pid_path.exists():
-        print("Daemon is not running (no PID file)")
-        return False
-
-    try:
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, 0)
-
-        print(f"Daemon is running (PID: {pid})")
-        print(f"Socket: {socket_path}")
-
-        if socket_path.exists():
-            print("Socket file exists")
-            import socket as sock
-            try:
-                test_sock = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
-                test_sock.connect(str(socket_path))
-                test_sock.close()
-                print("Socket connection: OK")
-                return True
-            except Exception as e:
-                print(f"Socket connection: FAILED ({e})")
-                return False
-        else:
-            print("Socket file: MISSING")
-            return False
-
-    except ProcessLookupError:
-        print("Daemon is not running (process not found)")
-        pid_path.unlink()
-        return False
-    except Exception as e:
-        print(f"Error checking status: {e}")
-        return False
-
-
 def main():
     """Main entry point for daemon server."""
+    from vtuber.daemon.cli import setup_logging
+
     setup_logging()
     try:
         server = DaemonServer()

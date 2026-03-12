@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-from vtuber.tools.memory import SessionManager, Session
+from vtuber.session import SessionManager, Session
 
 
 def test_session_manager_create():

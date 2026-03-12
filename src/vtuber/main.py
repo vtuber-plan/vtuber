@@ -75,13 +75,13 @@ def main():
     command = sys.argv[1]
 
     if command == "start":
-        from vtuber.daemon.server import start_daemon_background
+        from vtuber.daemon.cli import start_daemon_background
         start_daemon_background()
     elif command == "stop":
-        from vtuber.daemon.server import stop_daemon
+        from vtuber.daemon.cli import stop_daemon
         stop_daemon()
     elif command == "status":
-        from vtuber.daemon.server import check_status
+        from vtuber.daemon.cli import check_status
         check_status()
     elif command == "chat":
         from vtuber.client.cli import main as cli_main
@@ -93,7 +93,7 @@ def main():
         from vtuber.providers.onebot import main as onebot_main
         onebot_main()
     elif command == "restart":
-        from vtuber.daemon.server import stop_daemon, start_daemon_background
+        from vtuber.daemon.cli import stop_daemon, start_daemon_background
         stop_daemon()
         start_daemon_background()
     elif command == "reload":
