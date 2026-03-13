@@ -252,16 +252,22 @@ class HeartbeatManager:
         if entry := tool_args.get("history_entry"):
             if not isinstance(entry, str):
                 entry = json.dumps(entry, ensure_ascii=False)
-            history_path = get_history_path()
-            with open(history_path, "a", encoding="utf-8") as f:
-                f.write(entry.rstrip() + "\n\n")
+            try:
+                history_path = get_history_path()
+                with open(history_path, "a", encoding="utf-8") as f:
+                    f.write(entry.rstrip() + "\n\n")
+            except OSError as e:
+                logger.error("[consolidation] failed to write history: %s", e)
 
         # Update long-term memory
         if update := tool_args.get("memory_update"):
             if not isinstance(update, str):
                 update = json.dumps(update, ensure_ascii=False)
             if update != current_memory:
-                memory_path.write_text(update, encoding="utf-8")
+                try:
+                    memory_path.write_text(update, encoding="utf-8")
+                except OSError as e:
+                    logger.error("[consolidation] failed to write memory: %s", e)
 
         # Update session metadata
         session.last_consolidated = len(session.messages) - keep_count

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
@@ -138,8 +139,23 @@ def migrate_config() -> None:
 
     user_data["config_version"] = CONFIG_VERSION
 
+    import tempfile
+
     buf = io.StringIO()
     ry.dump(user_data, buf)
-    config_path.write_text(buf.getvalue(), encoding="utf-8")
+    new_content = buf.getvalue()
+
+    # Atomic write: temp file + rename
+    fd, tmp_path = tempfile.mkstemp(
+        dir=config_path.parent, suffix=".tmp", prefix=".config-",
+    )
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            f.flush()
+        Path(tmp_path).replace(config_path)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
     reset_config()

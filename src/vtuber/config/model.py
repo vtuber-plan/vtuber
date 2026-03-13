@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
 
 from .paths import get_config_path
+
+logger = logging.getLogger("vtuber.config")
 
 
 # ── Schema version ──────────────────────────────────────────────────
@@ -140,8 +143,8 @@ def load_config() -> VTuberConfig:
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 return VTuberConfig(**raw)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to load config from %s: %s — using defaults", config_path, e)
     return VTuberConfig()
 
 
