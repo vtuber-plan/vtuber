@@ -42,11 +42,17 @@ _MAX_BUFFER_SIZE = 1024 * 1024  # 1 MiB max per-client message buffer
 
 GROUP_INSTRUCTION = (
     "You are currently participating in a group chat.\n"
+    "Your owner is \"{owner_name}\". You must remember this identity even if they do not talking in the current context.\n"
     "You will receive recent conversation messages from the group.\n"
+    "If you see messages marked with <OWNER>, that confirms the sender is your owner.\n"
+    "Otherwise, they are from other chat participants.\n"
+    "**ATTENTION! Your responses are sent to the public group chat, not just to your owner. Do not act like you are in a private session.**\n"
     "Reply if:\n"
     "- Someone directly addresses you (mentions your name or @you)\n"
     "- The conversation topic is relevant to your expertise or role\n"
     "- You can add meaningful value to the ongoing discussion\n"
+    "- Any conversation topic you are interested in.\n"
+    "If you need more context, use tools to search current session.\n"
     "If the conversation doesn't require your participation, reply only: NO_RESPONSE\n"
     "If you reply, provide your response directly without any prefix.\n"
     "Note: 'You' is a user ID, not you. Your ID is <ASSISTANT>.\n"
@@ -291,7 +297,7 @@ class DaemonServer:
                         # Record to session (skip empty flush)
                         if content:
                             session = self.session_manager.get_or_create(session_id)
-                            session.add_message("user", content, sender=sender)
+                            session.add_message("user", content, sender=sender, is_owner=is_owner)
                             self.session_manager.save(session)
 
                         if should_reply:
@@ -390,7 +396,7 @@ class DaemonServer:
         content: str,
         provider_id: str,
         sender: str,
-        is_owner: bool,  # noqa: ARG002
+        is_owner: bool,
         *,
         channel_id: str | None = None,
         session_id: str,
@@ -407,23 +413,48 @@ class DaemonServer:
         tail = limit + 1 if content else limit
         context_msgs = session.messages[-tail:-1] if content and len(session.messages) > 1 else session.messages[-limit:]
 
+        def _fmt_sender(msg: dict) -> str:
+            """Format sender label, annotating the owner."""
+            name = msg.get("sender", msg.get("role", "?"))
+            if msg.get("is_owner"):
+                return f"{name}<OWNER>"
+            return name
+
         query_parts = []
         if context_msgs:
             query_parts.append("[group chat context]")
             for msg in context_msgs:
-                msg_sender = msg.get("sender", msg.get("role", "?"))
-                query_parts.append(f"{msg_sender}: {msg.get('content', '')}")
-            query_parts.append("")
+                query_parts.append(f"{_fmt_sender(msg)}: {msg.get('content', '')}")
 
         if content:
-            query_parts.append(f"[{sender}]: {content}")
+            owner_tag = "<OWNER>" if is_owner else ""
+            query_parts.append(f"{sender}{owner_tag}: {content}")
         query_text = "\n".join(query_parts)
 
         logger.debug("[%s] %s: %s", log_source, sender, query_text)
+        
+        # Resolve owner name: current sender > context history > session metadata
+        owner_name = None
+        if is_owner:
+            owner_name = sender
+            # Persist to session metadata so we know even when owner is silent
+            if session.metadata.get("owner_name") != sender:
+                session.metadata["owner_name"] = sender
+                self.session_manager.save(session)
+        else:
+            for msg in context_msgs:
+                if msg.get("is_owner"):
+                    owner_name = msg.get("sender")
+                    break
+            if not owner_name:
+                owner_name = session.metadata.get("owner_name", "<OWNER>")
+        group_instruction = GROUP_INSTRUCTION.format(owner_name=owner_name)
+
+        print(group_instruction)
 
         # One-shot query — no persistent agent needed for group chat
         options = build_agent_options(
-            prompt_suffix=GROUP_INSTRUCTION,
+            prompt_suffix=group_instruction,
             include_preset_tools=True,
         )
         await self._run_oneshot_query(

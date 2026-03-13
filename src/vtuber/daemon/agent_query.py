@@ -213,9 +213,20 @@ async def collect_response(
 # ── One-shot (ephemeral) query streaming ──────────────────────────
 
 
-async def _as_async_iter(text: str) -> AsyncIterable[str]:
-    """Wrap a string prompt as an AsyncIterable for sdk_query streaming mode."""
-    yield text
+async def _as_async_iter(text: str) -> AsyncIterable[dict]:
+    """Wrap a string prompt as an AsyncIterable[dict] for sdk_query streaming mode.
+
+    The SDK's stream_input expects each yielded item to be a JSON-serialisable
+    dict matching the wire format (type=user message object).  Yielding a raw
+    string causes ``json.dumps(str)`` to produce a JSON string literal which
+    the CLI rejects with "Received non-object JSON in stream-json mode".
+    """
+    yield {
+        "type": "user",
+        "session_id": "",
+        "message": {"role": "user", "content": text},
+        "parent_tool_use_id": None,
+    }
 
 
 async def iter_oneshot(

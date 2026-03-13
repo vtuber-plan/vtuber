@@ -52,15 +52,13 @@ SENDER_COLORS = {
     "Charlie": "yellow",
 }
 
-BATCH_SIZE = 5
-
-
 class MockGroupProvider(QueuedProvider):
     """Mock group chat provider for testing.
 
     Simulates a group chat with pre-seeded fake messages.
-    User types messages to fill a batch; when batch is full,
-    it's sent to the daemon as a group message.
+    Messages are sent to the daemon individually (as in real group chat).
+    Use /flush to manually trigger agent evaluation, or /mention to
+    simulate a mention that triggers immediate reply.
     """
 
     provider_type = "mock-group"
@@ -68,6 +66,7 @@ class MockGroupProvider(QueuedProvider):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._round = 0
+        self._msg_count = 0
         self.session = PromptSession()
 
     # ── Provider callback overrides ───────────────────────────────
@@ -140,6 +139,38 @@ class MockGroupProvider(QueuedProvider):
                     )
                     return None
 
+    async def _send_and_display(
+        self, msg: ChatMessage, *, should_reply: bool = False,
+    ) -> None:
+        """Send a chat message to daemon and display it."""
+        session_id = f"mock:group:{CHANNEL_ID}"
+        self._print_chat_message(msg)
+        await self.send_message(
+            msg.content,
+            sender=msg.sender,
+            is_owner=(msg.sender == "You"),
+            is_private=False,
+            should_reply=should_reply,
+            channel_id=CHANNEL_ID,
+            session_id=session_id,
+        )
+        self._msg_count += 1
+
+    async def _flush_trigger(self) -> str | None:
+        """Send a flush (empty content) to trigger agent evaluation."""
+        session_id = f"mock:group:{CHANNEL_ID}"
+        console.print("[dim]>>> Flush: 触发 Agent 评估...[/dim]")
+        await self.send_message(
+            "",
+            sender="",
+            is_owner=False,
+            is_private=False,
+            should_reply=True,
+            channel_id=CHANNEL_ID,
+            session_id=session_id,
+        )
+        return await self._wait_for_response()
+
     # ── Main loop ────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -161,8 +192,11 @@ class MockGroupProvider(QueuedProvider):
                 f"[green]已连接到 VTuber daemon[/green]\n"
                 f"频道: [bold]{CHANNEL_ID}[/bold]\n"
                 f"群成员: {', '.join(FAKE_USERS)} + You\n\n"
-                f"每轮预置 3 条消息，你输入 2 条后发送给 Agent。\n"
-                f"输入 [bold]/quit[/bold] 退出",
+                f"直接输入消息发送到群聊（不触发回复）\n"
+                f"[bold]/flush[/bold]  手动触发 Agent 评估上下文\n"
+                f"[bold]/mention[/bold] 模拟 @Agent 立即回复\n"
+                f"[bold]/seed[/bold]   注入一组预置对话\n"
+                f"[bold]/quit[/bold]   退出",
                 title="Mock Group Chat",
                 border_style="green",
             )
@@ -171,95 +205,71 @@ class MockGroupProvider(QueuedProvider):
 
         try:
             while self.running:
-                # ── Start a new round ──
-                seed_messages = self._get_seed_messages()
-                buffer: list[ChatMessage] = list(seed_messages)
-
-                console.print(Rule(f"[bold]Round {self._round + 1}[/bold]"))
-                console.print()
-
-                # Display pre-seeded messages
-                for msg in seed_messages:
-                    self._print_chat_message(msg)
-
-                # Collect user messages until batch is full
-                needed = BATCH_SIZE - len(buffer)
-                for i in range(needed):
-                    remaining = needed - i
-                    try:
-                        user_input = await self.session.prompt_async(
-                            HTML(
-                                f"<ansigreen><b>You</b></ansigreen>"
-                                f"<ansigray> ({remaining} left) › </ansigray>"
-                            ),
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        await self.disconnect()
-                        return
-
-                    if user_input.strip().lower() in ("/quit", "/exit"):
-                        await self.disconnect()
-                        console.print("\n[dim]已断开连接[/dim]")
-                        return
-
-                    if not user_input.strip():
-                        user_input = random.choice(["嗯嗯", "哈哈", "有道理", "确实"])
-
-                    user_msg = ChatMessage(sender="You", content=user_input.strip())
-                    buffer.append(user_msg)
-                    self._print_chat_message(user_msg)
-
-                # ── Send batch to daemon ──
-                console.print()
-                console.print("[dim]>>> 发送 {0} 条消息给 Agent...[/dim]".format(len(buffer)))
-
-                session_id = f"mock:group:{CHANNEL_ID}"
-
-                # Send context messages (should_reply=False) then trigger (should_reply=True)
-                for msg in buffer[:-1]:
-                    await self.send_message(
-                        msg.content,
-                        sender=msg.sender,
-                        is_owner=(msg.sender == "You"),
-                        is_private=False,
-                        should_reply=False,
-                        channel_id=CHANNEL_ID,
-                        session_id=session_id,
+                try:
+                    user_input = await self.session.prompt_async(
+                        HTML(
+                            "<ansigreen><b>You</b></ansigreen>"
+                            "<ansigray> › </ansigray>"
+                        ),
                     )
+                except (EOFError, KeyboardInterrupt):
+                    await self.disconnect()
+                    return
 
-                trigger = buffer[-1]
-                await self.send_message(
-                    trigger.content,
-                    sender=trigger.sender,
-                    is_owner=(trigger.sender == "You"),
-                    is_private=False,
-                    should_reply=True,
-                    channel_id=CHANNEL_ID,
-                    session_id=session_id,
-                )
+                text = user_input.strip()
 
-                response = await self._wait_for_response()
+                if text.lower() in ("/quit", "/exit"):
+                    await self.disconnect()
+                    console.print("\n[dim]已断开连接[/dim]")
+                    return
 
-                if response:
-                    console.print()
-                    console.print(
-                        Panel(
-                            Markdown(response),
-                            title="[bold cyan]Agent[/bold cyan]",
-                            border_style="cyan",
-                            padding=(1, 2),
-                        )
-                    )
-                else:
-                    console.print()
-                    console.print("[dim italic]Agent 选择不回复[/dim italic]")
+                if text.lower() == "/flush":
+                    response = await self._flush_trigger()
+                    self._show_response(response)
+                    continue
 
-                console.print()
-                self._round += 1
+                if text.lower() == "/seed":
+                    seed = self._get_seed_messages()
+                    for msg in seed:
+                        await self._send_and_display(msg)
+                    console.print(f"[dim]已注入 {len(seed)} 条预置消息[/dim]")
+                    continue
+
+                if text.lower().startswith("/mention"):
+                    # /mention [text] — simulate a mention that triggers reply
+                    mention_text = text[len("/mention"):].strip() or "你觉得呢？"
+                    msg = ChatMessage(sender="You", content=mention_text)
+                    await self._send_and_display(msg, should_reply=True)
+                    response = await self._wait_for_response()
+                    self._show_response(response)
+                    continue
+
+                if not text:
+                    text = random.choice(["嗯嗯", "哈哈", "有道理", "确实"])
+
+                msg = ChatMessage(sender="You", content=text)
+                await self._send_and_display(msg)
 
         finally:
             await self.disconnect()
             console.print("\n[dim]已断开连接[/dim]")
+
+    def _show_response(self, response: str | None) -> None:
+        """Display agent response or no-response notice."""
+        if response:
+            console.print()
+            console.print(
+                Panel(
+                    Markdown(response),
+                    title="[bold cyan]Agent[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                )
+            )
+        else:
+            console.print()
+            console.print("[dim italic]Agent 选择不回复[/dim italic]")
+        console.print()
 
 
 def main():
