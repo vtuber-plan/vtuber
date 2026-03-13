@@ -76,15 +76,13 @@ async def extract_message_text(
                 if ctx:
                     parts.append(ctx)
 
-        elif seg_type in ("image", "file", "record") and is_private:
+        elif seg_type in ("file", "record") and is_private:
             url = data.get("url", "")
             filename = data.get("file", "")
             if url:
                 local_path = await download_file(url, filename)
                 if local_path:
-                    label = {"image": "图片", "file": "文件", "record": "语音"}.get(
-                        seg_type, "文件"
-                    )
+                    label = {"file": "文件", "record": "语音"}.get(seg_type, "文件")
                     parts.append(f"[{label}: {local_path}]")
                 else:
                     parts.append(f"[{seg_type}: 下载失败]")

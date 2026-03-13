@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from .message import extract_message_text
+from .message import download_file, extract_message_text
 
 if TYPE_CHECKING:
     from .provider import OneBotProvider
@@ -234,15 +234,69 @@ async def _debounce_flush(
     logger.debug("Debounce flush for group %s", group_id)
 
 
+# ── File upload helpers ────────────────────────────────────────────
+
+
+async def _handle_file_upload(
+    provider: OneBotProvider, event: dict,
+) -> None:
+    """Handle private file upload notice (offline_file)."""
+    from .provider import _PendingResponse
+
+    user_id = event.get("user_id")
+    is_owner = provider.owner_id and str(user_id) == provider.owner_id
+    nickname = str(user_id)
+
+    if (
+        not is_owner
+        and provider._user_whitelist
+        and str(user_id) not in provider._user_whitelist
+    ):
+        return
+
+    file_info = event.get("file", {})
+    url = file_info.get("url", "")
+    filename = file_info.get("name", "")
+
+    if not url:
+        logger.warning("File upload notice without URL: %s", event)
+        return
+
+    local_path = await download_file(url, filename)
+    if not local_path:
+        logger.warning("Failed to download uploaded file: %s", filename)
+        return
+
+    synthetic_text = f"[文件: {local_path}]"
+    session_id = f"onebot:private:{user_id}"
+    provider._pending[session_id] = _PendingResponse(
+        reply_to="private", user_id=user_id,
+    )
+    await provider.send_message(
+        synthetic_text,
+        sender=nickname,
+        is_owner=is_owner,
+        is_private=True,
+        session_id=session_id,
+    )
+
+    logger.info("File upload from %s: %s → %s", nickname, filename, local_path)
+
+
 # ── Notice events ──────────────────────────────────────────────────
 
 
 async def _handle_notice_event(provider: OneBotProvider, event: dict) -> None:
-    """Handle notice events (poke, etc.)."""
+    """Handle notice events (poke, file uploads, etc.)."""
     from .provider import _PendingResponse
 
     notice_type = event.get("notice_type")
     sub_type = event.get("sub_type")
+
+    # ── Private file upload notice ────────────────────────────────
+    if notice_type == "offline_file":
+        await _handle_file_upload(provider, event)
+        return
 
     if notice_type == "notify" and sub_type == "poke":
         target_id = event.get("target_id")
