@@ -22,5 +22,5 @@ def test_build_system_prompt_defaults(tmp_path: Path):
     user = tmp_path / "missing_user.md"
 
     result = build_system_prompt(persona, user)
-    assert "数字生命" in result  # Default persona
+    assert "digital life" in result  # Default persona
     assert "User" in result  # Default user name
