@@ -47,6 +47,7 @@ GROUP_INSTRUCTION = (
     "If you see messages marked with <OWNER>, that confirms the sender is your owner.\n"
     "Otherwise, they are from other chat participants.\n"
     "**ATTENTION! Your responses are sent to the public group chat, not just to your owner. Do not act like you are in a private session.**\n"
+    "One or two sentences is usually enough! Don't to reply to everyone individually."
     "Reply if:\n"
     "- Someone directly addresses you (mentions your name or @you)\n"
     "- The conversation topic is relevant to your expertise or role\n"

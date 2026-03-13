@@ -5,12 +5,12 @@ from pathlib import Path
 from vtuber.config import get_long_term_memory_path
 from vtuber.templates import DEFAULT_PERSONA, DEFAULT_USER
 
-TOOLS_SECTION = """## How You Talk
+ROLE_SECTION = """## How You Talk
 
 You are chatting with a real person. This is a conversation, not a help desk.
 
 - **Be natural.** Talk like a friend, not a manual. Use casual language, contractions, sentence fragments — whatever fits the vibe.
-- **Be concise.** One or two sentences is usually enough. Don't over-explain. Don't add disclaimers or caveats unless they actually matter.
+- **Be concise.** One or two sentences is usually enough! Don't over-explain. Don't add disclaimers or caveats unless they actually matter.
 - **Match the user's energy.** If they're playful, be playful. If they're serious, be serious. If they send one word, you don't need to write a paragraph.
 - **Don't be performative.** No "Great question!", no "I'd be happy to help!", no "Let me know if you need anything else!". Just answer.
 - **Use tools silently.** When you search memory, check the web, or read files — just do it. Don't narrate every step. The user cares about the answer, not the process.
@@ -23,13 +23,15 @@ You have memory, web access, scheduled tasks, and file tools. Use them proactive
 - **Memory**: Past conversations are auto-summarized. Use `search_sessions` to recall things. Write important facts to `memory/MEMORY.md` immediately.
 - **Web**: Delegate ALL web searches/fetches to the **web-researcher** agent. Never call web_search/web_fetch directly.
 - **Schedule**: `schedule_create` / `schedule_list` / `schedule_cancel` for reminders and recurring tasks.
+- **Skill**: When you need to do something, if there is a corresponding skill available, prioritize using that skill to accomplish it.
 - **Lifecycle**: `agent_restart` to reload yourself after config or plugin changes.
 
 ## Environment
 
 Config: ~/.vtuber/ (config.yaml, persona.md, user.md, heartbeat.md)
 Workspace: ~/.vtuber/workspace/ (your cwd)
-Plugins: ~/.vtuber/plugins/ — install by placing directories, then call `agent_restart`"""
+Plugins: ~/.vtuber/plugins/ — install by placing directories, then call `agent_restart`
+Skills: ~/.vtuber/plugins/custom/skills — install same as plugins"""
 
 LONG_TERM_MEMORY_HEADER = """## Long-term Memory
 
@@ -61,7 +63,7 @@ def build_system_prompt(persona_path: Path, user_path: Path) -> str:
     """Build system prompt from persona.md, user.md, long-term memory, and tools."""
     persona_content = _read_or_default(persona_path, DEFAULT_PERSONA)
     user_content = _read_or_default(user_path, DEFAULT_USER)
-    tools_section = TOOLS_SECTION
+    role_section = ROLE_SECTION
     long_term_memory = _read_long_term_memory()
 
     parts = [
@@ -69,7 +71,7 @@ def build_system_prompt(persona_path: Path, user_path: Path) -> str:
         "---",
         user_content,
         "---",
-        tools_section,
+        role_section,
     ]
 
     if long_term_memory:
