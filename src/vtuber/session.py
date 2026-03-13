@@ -2,6 +2,9 @@
 
 import json
 import logging
+import re
+import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -39,16 +42,21 @@ class Session:
 
 def _safe_filename(key: str) -> str:
     """Convert session key to safe filename."""
-    return key.replace(":", "_").replace("/", "_")
+    safe = key.replace(":", "_").replace("/", "_")
+    safe = re.sub(r'[^\w\-.]', '_', safe)
+    safe = safe.strip(".").replace("..", "_")
+    return safe or "unnamed"
 
 
 class SessionManager:
     """Manages conversation sessions stored as JSONL files."""
 
+    _MAX_CACHE = 100
+
     def __init__(self, sessions_dir: Path):
         self.sessions_dir = sessions_dir
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self._cache: dict[str, Session] = {}
+        self._cache: OrderedDict[str, Session] = OrderedDict()
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -58,6 +66,7 @@ class SessionManager:
     def get_or_create(self, key: str) -> Session:
         """Get an existing session or create a new one."""
         if key in self._cache:
+            self._cache.move_to_end(key)
             return self._cache[key]
 
         session = self._load(key)
@@ -65,6 +74,8 @@ class SessionManager:
             session = Session(key=key)
 
         self._cache[key] = session
+        while len(self._cache) > self._MAX_CACHE:
+            self._cache.popitem(last=False)
         return session
 
     def _load(self, key: str) -> Session | None:
@@ -102,27 +113,39 @@ class SessionManager:
                 last_consolidated=last_consolidated
             )
         except Exception as e:
-            logger.error(f"Failed to load session {key}: {e}")
+            logger.error("Failed to load session %s: %s", key, e)
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session to disk atomically."""
         path = self._get_session_path(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        metadata_line = {
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        }
+
+        # Write to temp file in the same directory, then atomic rename
+        fd, tmp_path = tempfile.mkstemp(
+            dir=self.sessions_dir, suffix=".tmp", prefix=".session-",
+        )
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.flush()
+            Path(tmp_path).replace(path)
+        except BaseException:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
 
         self._cache[session.key] = session
+        self._cache.move_to_end(session.key)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all sessions."""
