@@ -452,9 +452,11 @@ class DaemonServer:
         group_instruction = GROUP_INSTRUCTION.format(owner_name=owner_name)
 
         # One-shot query — no persistent agent needed for group chat
+        # Security: no preset tools (Bash, Read, Write…) in group chat.
+        # Group members should not be able to trigger system commands.
         options = build_agent_options(
             prompt_suffix=group_instruction,
-            include_preset_tools=True,
+            include_preset_tools=False,
         )
         await self._run_oneshot_query(
             query_text, options, provider_id, session_id, log_source,
