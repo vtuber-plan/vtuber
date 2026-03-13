@@ -14,7 +14,7 @@ from vtuber.config import (
 from vtuber.daemon.agents import build_agent_options
 from vtuber.daemon.gateway import Gateway
 from vtuber.daemon.protocol import MessageType
-from vtuber.daemon.agent_query import collect_oneshot, truncate
+from vtuber.daemon.agent_query import collect_oneshot, extract_tool_call, truncate
 from vtuber.templates import DEFAULT_HEARTBEAT
 
 logger = logging.getLogger("vtuber.daemon")
@@ -72,42 +72,6 @@ _SAVE_MEMORY_TOOL = [
         },
     }
 ]
-
-
-# ── Shared tool-call extraction ──────────────────────────────────
-
-
-async def _extract_tool_call(
-    prompt: str,
-    system_prompt: str,
-    tools: list[dict],
-    tool_name: str,
-    log_label: str,
-) -> dict | None:
-    """Run a one-shot LLM query with forced tool use and extract the tool arguments.
-
-    Returns the tool input dict, or None if the LLM didn't call the expected tool.
-    """
-    from claude_agent_sdk import query as sdk_query
-    from claude_agent_sdk.types import AssistantMessage, ClaudeAgentOptions, ToolUseBlock
-
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        tools=tools,
-        tool_choice={"type": "tool", "name": tool_name},
-    )
-
-    try:
-        async for msg in sdk_query(prompt=prompt, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, ToolUseBlock) and block.name == tool_name:
-                        return block.input
-    except Exception as e:
-        logger.error("[%s] tool call extraction error: %s", log_label, e, exc_info=True)
-
-    logger.warning("[%s] LLM did not call %s tool", log_label, tool_name)
-    return None
 
 
 # ── HeartbeatManager ─────────────────────────────────────────────
@@ -172,7 +136,7 @@ class HeartbeatManager:
 
         try:
             # Phase 1: Decision
-            tool_args = await _extract_tool_call(
+            tool_args = await extract_tool_call(
                 prompt=f"Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n{heartbeat_content}",
                 system_prompt="You are a heartbeat agent. Call the heartbeat tool to report your decision.",
                 tools=_HEARTBEAT_TOOL,
@@ -273,7 +237,7 @@ class HeartbeatManager:
 ## Conversation to Process (session: {session.key})
 {chr(10).join(lines)}"""
 
-        tool_args = await _extract_tool_call(
+        tool_args = await extract_tool_call(
             prompt=prompt,
             system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
             tools=_SAVE_MEMORY_TOOL,

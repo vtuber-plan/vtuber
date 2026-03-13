@@ -84,7 +84,7 @@ def main():
         from vtuber.daemon.cli import check_status
         check_status()
     elif command == "chat":
-        from vtuber.client.cli import main as cli_main
+        from vtuber.providers.cli import main as cli_main
         cli_main()
     elif command == "mock-group":
         from vtuber.providers.mock_group import main as mock_main

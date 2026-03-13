@@ -34,5 +34,5 @@ dev = [
 [project.scripts]
 vtuber = "vtuber.main:main"
 vtuber-daemon = "vtuber.daemon.server:main"
-vtuber-cli = "vtuber.client.cli:main"
+vtuber-cli = "vtuber.providers.cli:main"
 vtuber-onebot = "vtuber.providers.onebot:main"

@@ -1,12 +1,14 @@
 """Unix Domain Socket server for daemon."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import signal
 import sys
-import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeSDKClient
@@ -22,12 +24,12 @@ from vtuber.config import (
     migrate_config,
     reset_config,
 )
-from vtuber.daemon.agents import AgentPool
+from vtuber.daemon.agents import AgentPool, build_agent_options, safe_disconnect
 from vtuber.daemon.gateway import Gateway, ProviderConnection
 from vtuber.daemon.heartbeat import HeartbeatManager
 from vtuber.daemon.protocol import MessageType, decode_message, encode_message
 from vtuber.daemon.scheduler import TaskScheduler
-from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, truncate
+from vtuber.daemon.agent_query import AgentTimeoutError, iter_response, iter_oneshot, truncate
 from vtuber.daemon.tasks import ScheduledTaskRunner
 from vtuber.session import SessionManager
 from vtuber.tools.schedule import set_scheduler, set_task_queue
@@ -37,11 +39,14 @@ logger = logging.getLogger("vtuber.daemon")
 
 GROUP_INSTRUCTION = (
     "You are currently participating in a group chat.\n"
-    "You will receive recent conversation messages from the group. "
-    "Please decide whether you need to participate in the conversation based on the content.\n"
-    "If the conversation doesn't require your participation, please only reply: NO_RESPONSE\n"
-    "If you need to reply, directly provide the content without adding any prefix.\n"
-    "Note, 'You' is not you, it just a user id. Your ID is <ASSISTANT>.\n"
+    "You will receive recent conversation messages from the group.\n"
+    "Reply if:\n"
+    "- Someone directly addresses you (mentions your name or @you)\n"
+    "- The conversation topic is relevant to your expertise or role\n"
+    "- You can add meaningful value to the ongoing discussion\n"
+    "If the conversation doesn't require your participation, reply only: NO_RESPONSE\n"
+    "If you reply, provide your response directly without any prefix.\n"
+    "Note: 'You' is a user ID, not you. Your ID is <ASSISTANT>.\n"
 )
 
 
@@ -49,8 +54,38 @@ def _build_agent_profiles() -> dict[str, dict]:
     """Build agent creation profiles for the pool."""
     return {
         "private": dict(include_schedule=True, include_preset_tools=True),
-        "group": dict(prompt_suffix=GROUP_INSTRUCTION, include_preset_tools=True),
     }
+
+
+# ── Slash-command system ──────────────────────────────────────────
+
+# handler(server, session_id, provider_id) -> response text
+CommandHandler = Callable[["DaemonServer", str, str], Awaitable[str]]
+
+
+async def _cmd_clear(server: DaemonServer, session_id: str, provider_id: str) -> str:
+    """Clear session history and reset agent context."""
+    session = server.session_manager.get_or_create(session_id)
+    session.messages.clear()
+    server.session_manager.save(session)
+
+    await server.agent_pool.reset_context(session_id)
+
+    return "Session cleared."
+
+
+async def _cmd_stop(server: DaemonServer, session_id: str, provider_id: str) -> str:
+    """Interrupt the running agent query for this session."""
+    agent = server.agent_pool._agents.get(session_id)
+    if not agent:
+        return "No running agent to stop."
+
+    try:
+        await agent.interrupt()
+    except Exception as e:
+        return f"Interrupt failed: {e}"
+
+    return "Agent interrupted."
 
 
 class DaemonServer:
@@ -71,6 +106,12 @@ class DaemonServer:
         # Subsystems (initialized in start())
         self._heartbeat: HeartbeatManager | None = None
         self._task_runner: ScheduledTaskRunner | None = None
+
+        # Command registry: command string -> async handler(server, session_id, provider_id)
+        self._commands: dict[str, CommandHandler] = {
+            "/clear": _cmd_clear,
+            "/stop": _cmd_stop,
+        }
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create a per-session lock for concurrent session isolation."""
@@ -215,27 +256,42 @@ class DaemonServer:
                 if not pid:
                     logger.warning("User message from unregistered provider, ignoring")
                 else:
-                    # Unified flow: record to session first
                     session_id = session_id or (
                         f"dm:{pid}:{sender}" if is_private
                         else f"group:{channel_id or 'unknown'}"
                     )
-                    session = self.session_manager.get_or_create(session_id)
-                    session.add_message("user", content, sender=sender)
-                    self.session_manager.save(session)
 
-                    if should_reply:
-                        if is_private:
-                            await self._handle_private_message(
-                                content, pid, sender, is_owner,
-                                session_id=session_id,
-                            )
-                        else:
-                            await self._handle_group_message(
-                                content, pid, sender, is_owner,
-                                channel_id=channel_id,
-                                session_id=session_id,
-                            )
+                    # Slash-command interception (exact match)
+                    handler = self._commands.get(content.strip()) if content else None
+                    if handler:
+                        reply = await handler(self, session_id, pid)
+                        await self.gateway.send_to(pid, {
+                            "type": MessageType.ASSISTANT_MESSAGE,
+                            "step": 0,
+                            "content": reply,
+                            "done": True,
+                            "session_id": session_id,
+                        })
+                    else:
+                        # Record to session (skip empty flush)
+                        if content:
+                            session = self.session_manager.get_or_create(session_id)
+                            session.add_message("user", content, sender=sender)
+                            self.session_manager.save(session)
+
+                        if should_reply:
+                            if is_private:
+                                coro = self._handle_private_message(
+                                    content, pid, sender, is_owner,
+                                    session_id=session_id,
+                                )
+                            else:
+                                coro = self._handle_group_message(
+                                    content, pid, sender, is_owner,
+                                    channel_id=channel_id,
+                                    session_id=session_id,
+                                )
+                            asyncio.create_task(coro)
 
             elif msg_type == MessageType.PING:
                 response = encode_message({"type": MessageType.PONG})
@@ -263,25 +319,17 @@ class DaemonServer:
         log_source: str,
         *,
         profile: str = "private",
-        sdk_session_id: str | None = None,
         no_response_token: str | None = None,
         notify_heartbeat: bool = False,
     ):
-        """Shared message handler: acquire agent, run query, handle errors.
-
-        Args:
-            sdk_session_id: Session ID for the SDK agent. Defaults to session_id.
-                Use a unique value per query to disable SDK-level conversation history
-                (e.g. for group chat where we build context ourselves).
-        """
-        effective_sdk_session = sdk_session_id or session_id
+        """Shared message handler: acquire agent, run query, handle errors."""
+        agent = None
         try:
             agent = await self.agent_pool.get(session_id, profile=profile)
             lock = self._get_session_lock(session_id)
             async with lock:
                 await self._run_agent_query(
                     agent, query, provider_id, session_id, log_source,
-                    sdk_session_id=effective_sdk_session,
                     no_response_token=no_response_token,
                 )
             if notify_heartbeat and self._heartbeat:
@@ -303,6 +351,11 @@ class DaemonServer:
                 "type": MessageType.ERROR,
                 "content": str(e),
             })
+        finally:
+            # If agent was evicted from pool during query (e.g. /clear),
+            # we own the last reference — clean it up to avoid subprocess leak.
+            if agent and not self.agent_pool.owns(session_id, agent):
+                await safe_disconnect(agent)
 
     async def _handle_private_message(
         self, content: str, provider_id: str, sender: str, is_owner: bool,
@@ -327,14 +380,17 @@ class DaemonServer:
         channel_id: str | None = None,
         session_id: str,
     ):
-        """Handle a group chat message — persistent agent with NO_RESPONSE support."""
+        """Handle a group chat message — one-shot query with NO_RESPONSE support."""
         channel_label = channel_id or "unknown"
         log_source = f"group/{channel_label}"
 
-        # Build context from session history (the current message was already appended)
+        # Build context from session history
         session = self.session_manager.get_or_create(session_id)
         limit = get_config().group_context_limit
-        context_msgs = session.messages[-(limit + 1):-1] if len(session.messages) > 1 else []
+        # For flush (content=""), all context comes from history
+        # For normal messages, the current message was already appended
+        tail = limit + 1 if content else limit
+        context_msgs = session.messages[-tail:-1] if content and len(session.messages) > 1 else session.messages[-limit:]
 
         query_parts = []
         if context_msgs:
@@ -344,15 +400,19 @@ class DaemonServer:
                 query_parts.append(f"{msg_sender}: {msg.get('content', '')}")
             query_parts.append("")
 
-        query_parts.append(f"[{sender}]: {content}")
+        if content:
+            query_parts.append(f"[{sender}]: {content}")
         query_text = "\n".join(query_parts)
 
         logger.debug("[%s] %s: %s", log_source, sender, query_text)
 
-        await self._dispatch_to_agent(
-            query_text, provider_id, session_id, log_source,
-            profile="group",
-            sdk_session_id=uuid.uuid4().hex,
+        # One-shot query — no persistent agent needed for group chat
+        options = build_agent_options(
+            prompt_suffix=GROUP_INSTRUCTION,
+            include_preset_tools=True,
+        )
+        await self._run_oneshot_query(
+            query_text, options, provider_id, session_id, log_source,
             no_response_token="NO_RESPONSE",
         )
 
@@ -388,35 +448,25 @@ class DaemonServer:
         except Exception:
             pass
 
-    async def _run_agent_query(
+    async def _stream_events_to_provider(
         self,
-        agent: ClaudeSDKClient,
-        query: str,
+        events: "AsyncIterator[AgentEvent]",
         provider_id: str,
         session_id: str,
         log_source: str,
         *,
-        sdk_session_id: str | None = None,
         no_response_token: str | None = None,
     ):
-        """Run an agent query and forward each step to the provider.
+        """Forward agent events to a provider, guarantee done signal, and record session.
 
-        A single query may produce multiple steps: text messages,
-        tool-use progress, and a final done signal.  Each text step
-        is sent as a complete, independent assistant_message.
-
-        Guarantees that a done=True message is always sent, even on error.
+        Shared by both persistent agent queries and one-shot (ephemeral) queries.
         """
-
-        effective_sdk_session = sdk_session_id or session_id
         step = 0
         full_text = ""
         done_sent = False
 
         try:
-            async for event in iter_response(
-                agent, query, session_id=effective_sdk_session, log_source=log_source,
-            ):
+            async for event in events:
                 if event.type == "tool":
                     await self.gateway.send_to(provider_id, {
                         "type": MessageType.PROGRESS,
@@ -470,6 +520,49 @@ class DaemonServer:
                 session = self.session_manager.get_or_create(session_id)
                 session.add_message("<ASSISTANT>", full_text.strip())
                 self.session_manager.save(session)
+
+    async def _run_agent_query(
+        self,
+        agent: ClaudeSDKClient,
+        query: str,
+        provider_id: str,
+        session_id: str,
+        log_source: str,
+        *,
+        no_response_token: str | None = None,
+    ):
+        """Run a persistent agent query and forward events to the provider."""
+        events = iter_response(
+            agent, query, session_id=session_id, log_source=log_source,
+        )
+        await self._stream_events_to_provider(
+            events, provider_id, session_id, log_source,
+            no_response_token=no_response_token,
+        )
+
+    async def _run_oneshot_query(
+        self,
+        query: str,
+        options: "ClaudeAgentOptions",
+        provider_id: str,
+        session_id: str,
+        log_source: str,
+        *,
+        no_response_token: str | None = None,
+    ):
+        """Run a one-shot (ephemeral) query and forward events to the provider."""
+        try:
+            events = iter_oneshot(query, options, log_source=log_source)
+            await self._stream_events_to_provider(
+                events, provider_id, session_id, log_source,
+                no_response_token=no_response_token,
+            )
+        except Exception as e:
+            logger.error("[%s] oneshot error: %s", log_source, e, exc_info=True)
+            await self.gateway.send_to(provider_id, {
+                "type": MessageType.ERROR,
+                "content": str(e),
+            })
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

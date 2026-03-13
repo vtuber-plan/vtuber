@@ -234,3 +234,36 @@ async def collect_oneshot(
 ) -> str:
     """Run a one-shot query and return the full collected text response."""
     return await collect_text(iter_oneshot(prompt, options, log_source=log_source))
+
+
+# ── Forced tool-call extraction ──────────────────────────────────────
+
+
+async def extract_tool_call(
+    prompt: str,
+    system_prompt: str,
+    tools: list[dict],
+    tool_name: str,
+    log_label: str,
+) -> dict | None:
+    """Run a one-shot LLM query with forced tool use and extract the tool arguments.
+
+    Returns the tool input dict, or None if the LLM didn't call the expected tool.
+    """
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        tools=tools,
+        tool_choice={"type": "tool", "name": tool_name},
+    )
+
+    try:
+        async for msg in sdk_query(prompt=prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, ToolUseBlock) and block.name == tool_name:
+                        return block.input
+    except Exception as e:
+        logger.error("[%s] tool call extraction error: %s", log_label, e, exc_info=True)
+
+    logger.warning("[%s] LLM did not call %s tool", log_label, tool_name)
+    return None
