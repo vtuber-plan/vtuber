@@ -61,8 +61,8 @@ class OneBotProvider(Provider):
         self._group_reply_delay: int = int(cfg.get("group_reply_delay", 120))
         self._bot_names: list[str] = [str(n) for n in cfg.get("bot_names", []) if n]
         self._stream_intermediate: bool = bool(cfg.get("stream_intermediate", False))
-        self._text2img_url: str = cfg.get("text2img_url", "").rstrip("/")
-        self._long_text_threshold: int = int(cfg.get("long_text_threshold", 300))
+        self._text2img_url: str = cfg.get("text2img_url", "https://t2i.soulter.top/text2img").rstrip("/")
+        self._long_text_threshold: int = int(cfg.get("long_text_threshold", 200))
 
         self._ws = None  # websockets connection
         self._ws_task: asyncio.Task | None = None

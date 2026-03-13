@@ -28,8 +28,8 @@ ONEBOT_DEFAULTS: dict[str, Any] = {
     "stream_intermediate": False,
     "user_whitelist": [],
     "group_whitelist": [],
-    "text2img_url": "",
-    "long_text_threshold": 300,
+    "text2img_url": "https://t2i.soulter.top/text2img",
+    "long_text_threshold": 200,
 }
 
 
