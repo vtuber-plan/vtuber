@@ -21,8 +21,15 @@ def _resolve_allowed_dirs() -> list[Path]:
 
 
 def _is_path_allowed(file_path: str, allowed_dirs: list[Path]) -> bool:
-    """Check if *file_path* falls under any of the allowed directories."""
-    target = Path(file_path).expanduser().resolve()
+    """Check if *file_path* falls under any of the allowed directories.
+
+    Resolves symlinks so that a link inside an allowed dir pointing
+    outside is correctly rejected.
+    """
+    try:
+        target = Path(file_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
     return any(target == d or d in target.parents for d in allowed_dirs)
 
 

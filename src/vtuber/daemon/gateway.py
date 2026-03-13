@@ -98,11 +98,16 @@ class Gateway:
             if not ok:
                 disconnected.append(pid)
         for pid in disconnected:
-            self.connections.pop(pid, None)
-            logger.info("Removed dead connection: %s", pid)
+            conn = self.connections.pop(pid, None)
+            if conn:
+                await conn.close()
+                logger.info("Removed dead connection: %s", conn.info)
 
     async def close_all(self) -> None:
         """Close all connections."""
-        for conn in self.connections.values():
-            await conn.close()
+        for conn in list(self.connections.values()):
+            try:
+                await conn.close()
+            except Exception as e:
+                logger.debug("Error closing connection %s: %s", conn.info, e)
         self.connections.clear()

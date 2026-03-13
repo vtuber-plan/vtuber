@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,7 +24,10 @@ async def handle_onebot_event(provider: OneBotProvider, event: dict) -> None:
     if echo and echo in provider._api_futures:
         future = provider._api_futures.pop(echo)
         if not future.done():
-            future.set_result(event)
+            try:
+                future.set_result(event)
+            except asyncio.InvalidStateError:
+                pass
         return
 
     post_type = event.get("post_type")
@@ -84,7 +88,7 @@ async def _handle_message_event(provider: OneBotProvider, event: dict) -> None:
     else:
         return
 
-    sender_info = event.get("sender", {})
+    sender_info = event.get("sender") or {}
     nickname = (
         sender_info.get("card")
         or sender_info.get("nickname")
@@ -110,65 +114,124 @@ async def _handle_message_event(provider: OneBotProvider, event: dict) -> None:
         if not group_id:
             return
 
-        # Track unseen message count
-        provider._group_unseen[group_id] = provider._group_unseen.get(group_id, 0) + 1
-
-        # Determine whether agent should reply
-        should_reply = False
-
-        # 1. Check if bot is @-mentioned
-        if isinstance(message, list):
-            for seg in message:
-                if (
-                    isinstance(seg, dict)
-                    and seg.get("type") == "at"
-                    and str(seg.get("data", {}).get("qq")) == str(provider._self_id)
-                ):
-                    should_reply = True
-                    break
-
-        # 2. Check if bot name is mentioned in text
-        if not should_reply and provider._bot_names:
-            text_lower = text.lower()
-            for name in provider._bot_names:
-                if name.lower() in text_lower:
-                    should_reply = True
-                    break
-
-        # 3. Check if accumulated messages reached batch threshold
-        if (
-            not should_reply
-            and provider._group_batch_size > 0
-            and provider._group_unseen[group_id] >= provider._group_batch_size
-        ):
-            should_reply = True
-
-        # Reset unseen counter when triggering reply
-        if should_reply:
-            provider._group_unseen[group_id] = 0
-
         session_id = f"onebot:group:{group_id}"
 
-        # Register pending response only when expecting a reply
-        if should_reply:
+        # Determine if this is a mention (@ or bot name)
+        is_mention = _check_mention(provider, message, text)
+
+        if is_mention:
+            # Cancel any active debounce timer — mention takes priority
+            _cancel_debounce(provider, group_id)
+
             provider._pending[session_id] = _PendingResponse(
                 reply_to="group", group_id=group_id,
             )
+            await provider.send_message(
+                text,
+                sender=nickname,
+                is_owner=is_owner,
+                is_private=False,
+                should_reply=True,
+                channel_id=str(group_id),
+                session_id=session_id,
+            )
+        else:
+            # Non-mention: record in daemon, start/reset debounce timer
+            await provider.send_message(
+                text,
+                sender=nickname,
+                is_owner=is_owner,
+                is_private=False,
+                should_reply=False,
+                channel_id=str(group_id),
+                session_id=session_id,
+            )
+            if provider._group_reply_delay > 0:
+                _start_debounce(provider, group_id, session_id)
 
-        # Forward every group message to daemon for session recording
-        await provider.send_message(
-            text,
-            sender=nickname,
-            is_owner=is_owner,
-            is_private=False,
-            should_reply=should_reply,
-            channel_id=str(group_id),
-            session_id=session_id,
-        )
         logger.debug(
-            "Group msg from %s(%s) in %s (reply=%s): %s",
-            nickname, user_id, group_id, should_reply, text[:50],
+            "Group msg from %s(%s) in %s (mention=%s): %s",
+            nickname, user_id, group_id, is_mention, text[:50],
         )
+
+
+# ── Group chat helpers ────────────────────────────────────────────
+
+
+def _check_mention(provider: OneBotProvider, message: object, text: str) -> bool:
+    """Check if the bot is @-mentioned or its name appears in the text."""
+    # 1. Check @mention in message segments
+    if isinstance(message, list):
+        for seg in message:
+            if (
+                isinstance(seg, dict)
+                and seg.get("type") == "at"
+                and str(seg.get("data", {}).get("qq")) == str(provider._self_id)
+            ):
+                return True
+
+    # 2. Check bot name in text
+    if provider._bot_names:
+        text_lower = text.lower()
+        for name in provider._bot_names:
+            if name.lower() in text_lower:
+                return True
+
+    return False
+
+
+def _cancel_debounce(provider: OneBotProvider, group_id: int) -> None:
+    """Cancel an active debounce timer for a group, if any."""
+    task = provider._group_debounce_tasks.pop(group_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _start_debounce(
+    provider: OneBotProvider, group_id: int, session_id: str,
+) -> None:
+    """Start or reset the debounce timer for a group."""
+    _cancel_debounce(provider, group_id)
+    provider._group_debounce_tasks[group_id] = asyncio.create_task(
+        _debounce_flush(provider, group_id, session_id)
+    )
+
+
+async def _debounce_flush(
+    provider: OneBotProvider, group_id: int, session_id: str,
+) -> None:
+    """Wait for the debounce delay, then signal the daemon to evaluate context."""
+    from .provider import _PendingResponse
+
+    try:
+        await asyncio.sleep(provider._group_reply_delay)
+    except asyncio.CancelledError:
+        return
+
+    # Timer fired — clean up our reference
+    provider._group_debounce_tasks.pop(group_id, None)
+
+    # Skip if agent is already processing a reply for this group
+    if session_id in provider._pending:
+        logger.debug("Debounce flush skipped for group %s — pending response", group_id)
+        return
+
+    # Register pending response (agent might reply)
+    provider._pending[session_id] = _PendingResponse(
+        reply_to="group", group_id=group_id,
+    )
+
+    # Send empty-content flush: daemon skips recording, goes straight to agent
+    await provider.send_message(
+        "",
+        sender="",
+        is_owner=False,
+        is_private=False,
+        should_reply=True,
+        channel_id=str(group_id),
+        session_id=session_id,
+    )
+    logger.debug("Debounce flush for group %s", group_id)
 
 
 # ── Notice events ──────────────────────────────────────────────────

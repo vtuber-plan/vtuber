@@ -1,6 +1,7 @@
 """Provider base class - abstract daemon communication + platform adaptation."""
 
 import asyncio
+import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
@@ -60,6 +61,16 @@ class Provider(ABC):
             return True
         except Exception as e:
             logger.error("Connection failed: %s", e)
+            # Clean up partially-established connection
+            self.running = False
+            if self.writer:
+                try:
+                    self.writer.close()
+                    await self.writer.wait_closed()
+                except Exception:
+                    pass
+            self.reader = None
+            self.writer = None
             return False
 
     async def disconnect(self) -> None:
@@ -107,6 +118,7 @@ class Provider(ABC):
     async def _send(self, msg: dict) -> None:
         """Send a raw message dict to daemon."""
         if not self.writer:
+            logger.warning("Cannot send message: not connected to daemon")
             return
         try:
             data = encode_message(msg)
@@ -135,8 +147,10 @@ class Provider(ABC):
                         try:
                             msg = decode_message(line)
                             await self._dispatch(msg)
-                        except Exception:
-                            pass
+                        except json.JSONDecodeError as e:
+                            logger.debug("Invalid JSON from daemon: %s", e)
+                        except Exception as e:
+                            logger.error("Error dispatching message: %s", e, exc_info=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:

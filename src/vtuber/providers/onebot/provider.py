@@ -57,7 +57,7 @@ class OneBotProvider(Provider):
         self.owner_id: str = str(cfg.get("owner_id", ""))
         self._user_whitelist: set[str] = {str(u) for u in cfg.get("user_whitelist", [])}
         self._group_whitelist: set[str] = {str(g) for g in cfg.get("group_whitelist", [])}
-        self._group_batch_size: int = int(cfg.get("group_batch_size", 0))
+        self._group_reply_delay: int = int(cfg.get("group_reply_delay", 120))
         self._bot_names: list[str] = [str(n) for n in cfg.get("bot_names", []) if n]
         self._stream_intermediate: bool = bool(cfg.get("stream_intermediate", False))
         self._text2img_url: str = cfg.get("text2img_url", "").rstrip("/")
@@ -66,7 +66,7 @@ class OneBotProvider(Provider):
         self._ws = None  # websockets connection
         self._ws_task: asyncio.Task | None = None
         self._pending: dict[str, _PendingResponse] = {}  # session_id -> buffer
-        self._group_unseen: dict[int, int] = {}  # group_id -> messages since last forward
+        self._group_debounce_tasks: dict[int, asyncio.Task] = {}  # group_id -> timer
         self._self_id: int | None = None  # bot's own QQ ID (from lifecycle event)
         self._action_echo: int = 0  # echo counter for action requests
         self._api_futures: dict[str, asyncio.Future] = {}  # echo -> Future
@@ -164,7 +164,7 @@ class OneBotProvider(Provider):
 
         future: asyncio.Future | None = None
         if wait:
-            future = asyncio.get_event_loop().create_future()
+            future = asyncio.get_running_loop().create_future()
             self._api_futures[echo_str] = future
 
         try:
@@ -178,11 +178,13 @@ class OneBotProvider(Provider):
         if future:
             try:
                 return await asyncio.wait_for(future, timeout=timeout)
-            except (TimeoutError, asyncio.TimeoutError):
+            except TimeoutError:
                 logger.warning("OneBot action %s timed out", action)
                 return None
             finally:
                 self._api_futures.pop(echo_str, None)
+                if not future.done():
+                    future.cancel()
         return None
 
     # ── Daemon Message Dispatch (override for session routing) ──
@@ -336,6 +338,10 @@ class OneBotProvider(Provider):
             if not fut.done():
                 fut.cancel()
         self._api_futures.clear()
+        # Cancel active debounce timers
+        for task in self._group_debounce_tasks.values():
+            task.cancel()
+        self._group_debounce_tasks.clear()
         await self.disconnect()
         console.print("[dim]OneBot provider 已停止[/dim]")
 
