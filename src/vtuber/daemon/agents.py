@@ -161,11 +161,12 @@ async def create_agent(
 
 
 async def safe_disconnect(agent: ClaudeSDKClient, timeout: float = 5.0) -> None:
-    """Disconnect an agent safely with a timeout."""
+    """Disconnect an agent safely with a timeout. Kills subprocess on failure."""
     try:
         await asyncio.wait_for(agent.disconnect(), timeout=timeout)
     except Exception:
-        pass
+        from vtuber.daemon.agent_query import kill_agent_process
+        kill_agent_process(agent)
 
 
 class AgentPool:
@@ -216,6 +217,14 @@ class AgentPool:
         for agent in self._agents.values():
             await safe_disconnect(agent)
         self._agents.clear()
+
+    def owns(self, session_id: str, agent: "ClaudeSDKClient") -> bool:
+        """Check if the pool still holds *agent* for *session_id*."""
+        return self._agents.get(session_id) is agent
+
+    def get_agent(self, session_id: str) -> "ClaudeSDKClient | None":
+        """Return the agent for *session_id* without creating one, or None."""
+        return self._agents.get(session_id)
 
     async def kill_and_recreate(
         self, session_id: str, profile: str = "private",

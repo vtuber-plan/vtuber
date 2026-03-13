@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -36,6 +37,8 @@ from vtuber.tools.schedule import set_scheduler, set_task_queue
 from vtuber.tools.lifecycle import consume_restart
 
 logger = logging.getLogger("vtuber.daemon")
+
+_MAX_BUFFER_SIZE = 1024 * 1024  # 1 MiB max per-client message buffer
 
 GROUP_INSTRUCTION = (
     "You are currently participating in a group chat.\n"
@@ -76,7 +79,7 @@ async def _cmd_clear(server: DaemonServer, session_id: str, provider_id: str) ->
 
 async def _cmd_stop(server: DaemonServer, session_id: str, provider_id: str) -> str:
     """Interrupt the running agent query for this session."""
-    agent = server.agent_pool._agents.get(session_id)
+    agent = server.agent_pool.get_agent(session_id)
     if not agent:
         return "No running agent to stop."
 
@@ -99,7 +102,8 @@ class DaemonServer:
         self.scheduler: TaskScheduler | None = None
         self._server: asyncio.Server | None = None
         self._task_queue: asyncio.Queue = asyncio.Queue()
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+        self._max_session_locks = 200
         self.session_manager = SessionManager(get_sessions_dir())
         self._pending_writers: dict[str, asyncio.StreamWriter] = {}
 
@@ -113,11 +117,18 @@ class DaemonServer:
             "/stop": _cmd_stop,
         }
 
+        self._shutdown_event: asyncio.Event | None = None
+
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
-        """Get or create a per-session lock for concurrent session isolation."""
-        if session_id not in self._session_locks:
-            self._session_locks[session_id] = asyncio.Lock()
-        return self._session_locks[session_id]
+        """Get or create a per-session lock. Evicts oldest when over limit."""
+        if session_id in self._session_locks:
+            self._session_locks.move_to_end(session_id)
+            return self._session_locks[session_id]
+        lock = asyncio.Lock()
+        self._session_locks[session_id] = lock
+        while len(self._session_locks) > self._max_session_locks:
+            self._session_locks.popitem(last=False)
+        return lock
 
     async def start(self):
         """Start the daemon server."""
@@ -175,10 +186,11 @@ class DaemonServer:
             self.socket_path, os.getpid(),
         )
 
-        # Setup signal handlers
+        # Setup signal handlers — schedule shutdown via event
+        self._shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+            loop.add_signal_handler(sig, self._shutdown_event.set)
 
     # ── Client handling ───────────────────────────────────────────
 
@@ -199,6 +211,9 @@ class DaemonServer:
                         break
 
                     buffer += data
+                    if len(buffer) > _MAX_BUFFER_SIZE:
+                        logger.warning("Client buffer exceeded %d bytes, disconnecting", _MAX_BUFFER_SIZE)
+                        break
                     while b"\n" in buffer:
                         raw_line, buffer = buffer.split(b"\n", 1)
                         line = raw_line.decode("utf-8", errors="replace")
@@ -583,21 +598,21 @@ class DaemonServer:
         if self.agent_pool:
             try:
                 await self.agent_pool.close_all()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing agent pool: %s", e)
 
         # Close provider connections
         try:
             await self.gateway.close_all()
-        except BaseException:
-            pass
+        except Exception as e:
+            logger.warning("Error closing gateway: %s", e)
 
         # Shutdown scheduler
         if self.scheduler:
             try:
                 self.scheduler.shutdown()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error shutting down scheduler: %s", e)
 
         # Close socket server
         if self._server:
@@ -617,8 +632,7 @@ class DaemonServer:
         """Run the server until shutdown."""
         await self.start()
         try:
-            while self.is_running:
-                await asyncio.sleep(1)
+            await self._shutdown_event.wait()
         except asyncio.CancelledError:
             pass
         finally:

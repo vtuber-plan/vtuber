@@ -16,6 +16,6 @@ class TaskScheduler:
         """Start the scheduler."""
         self.scheduler.start()
 
-    def shutdown(self):
+    def shutdown(self, wait: bool = True):
         """Shutdown the scheduler."""
-        self.scheduler.shutdown(wait=False)
+        self.scheduler.shutdown(wait=wait)

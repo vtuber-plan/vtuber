@@ -154,7 +154,7 @@ async def iter_response(
         idle_timeout = get_config().idle_timeout
     try:
         await asyncio.wait_for(agent.query(query, session_id=session_id), timeout=query_timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise AgentTimeoutError(
             f"agent.query() timed out after {query_timeout:.0f}s"
         ) from None
