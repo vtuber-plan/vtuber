@@ -22,16 +22,18 @@ def _reload_daemon():
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(30)
         sock.connect(str(socket_path))
-        msg = json.dumps({"type": "reload"}) + "\n"
-        sock.sendall(msg.encode("utf-8"))
+        try:
+            msg = json.dumps({"type": "reload"}) + "\n"
+            sock.sendall(msg.encode("utf-8"))
 
-        data = b""
-        while b"\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        sock.close()
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            sock.close()
 
         if data:
             resp = json.loads(data.decode("utf-8").strip())
