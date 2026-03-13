@@ -1,0 +1,8 @@
+{
+  "name": "vtuber",
+  "description": "Skill management and plugin scaffolding",
+  "version": "1.0.0",
+  "author": {
+    "name": "VTuber Built-in"
+  }
+}

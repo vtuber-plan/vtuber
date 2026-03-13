@@ -42,7 +42,6 @@ class OneBotProvider(Provider):
         access_token: Optional access token for authentication
         owner_id: QQ user ID of the bot owner
         bot_names: List of names the bot responds to in group chat
-        group_batch_size: Forward to agent every N messages (0 = disabled)
         text2img_url: Text2Image service URL (empty = disabled)
         long_text_threshold: Character count threshold for image rendering
     """

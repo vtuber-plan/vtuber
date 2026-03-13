@@ -1,8 +1,0 @@
-{
-  "name": "plugin-starter",
-  "description": "Scaffold new Claude Code plugins with best-practice structure",
-  "version": "1.0.0",
-  "author": {
-    "name": "VTuber Built-in"
-  }
-}
