@@ -15,7 +15,7 @@ logger = logging.getLogger("vtuber.config")
 
 # ── Schema version ──────────────────────────────────────────────────
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 # ── Provider example structures ─────────────────────────────────────
 

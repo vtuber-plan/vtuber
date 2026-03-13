@@ -431,7 +431,7 @@ class DaemonServer:
             query_parts.append(f"{sender}{owner_tag}: {content}")
         query_text = "\n".join(query_parts)
 
-        logger.debug("[%s] %s: %s", log_source, sender, query_text)
+        logger.debug("[%s] %s: %s", log_source, sender, truncate(query_text))
         
         # Resolve owner name: current sender > context history > session metadata
         owner_name = None
@@ -449,8 +449,6 @@ class DaemonServer:
             if not owner_name:
                 owner_name = session.metadata.get("owner_name", "<OWNER>")
         group_instruction = GROUP_INSTRUCTION.format(owner_name=owner_name)
-
-        print(group_instruction)
 
         # One-shot query — no persistent agent needed for group chat
         options = build_agent_options(

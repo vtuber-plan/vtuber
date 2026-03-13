@@ -43,10 +43,10 @@ async def render_text_as_image(text: str, text2img_url: str) -> str | None:
                 json={"html": html, "json": True},
             )
             resp.raise_for_status()
-            data = resp.json()
-            image_id = data.get("id")
+            body = resp.json()
+            image_id = body.get("data", {}).get("id")
             if image_id:
-                return f"{text2img_url}/data/{image_id}"
+                return f"{text2img_url}/{image_id}"
     except Exception as e:
         logger.warning("Text2Image service failed: %s", e)
     return None

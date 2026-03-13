@@ -280,12 +280,18 @@ class OneBotProvider(Provider):
 
         message: str | list[dict] = text
 
-        if should_render_as_image(
+        should_render = should_render_as_image(
             text,
             threshold=self._long_text_threshold,
             enabled=bool(self._text2img_url),
-        ):
+        )
+        logger.debug(
+            "text2img check: len=%d, threshold=%d, enabled=%s, should_render=%s",
+            len(text), self._long_text_threshold, bool(self._text2img_url), should_render,
+        )
+        if should_render:
             image_url = await render_text_as_image(text, self._text2img_url)
+            logger.debug("text2img result: %s", image_url)
             if image_url:
                 message = [{"type": "image", "data": {"file": image_url}}]
 
@@ -420,6 +426,9 @@ class OneBotProvider(Provider):
 
 def main():
     """Entry point for the OneBot provider."""
+    level = getattr(logging, get_config().log_level, logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
     try:
         provider = OneBotProvider()
         asyncio.run(provider.run())

@@ -67,6 +67,23 @@ def _build_providers_map(user_providers: dict[str, dict[str, Any]]) -> Commented
     return pm
 
 
+def _migrate_providers(user_data: CommentedMap) -> None:
+    """Backfill missing keys inside provider sections during migration."""
+    providers = user_data.get("providers")
+    if not isinstance(providers, CommentedMap):
+        return
+
+    # OneBot: add any keys present in ONEBOT_DEFAULTS but missing in user config
+    onebot = providers.get("onebot")
+    if isinstance(onebot, CommentedMap):
+        for key, default in ONEBOT_DEFAULTS.items():
+            if key not in onebot:
+                val = default
+                if isinstance(val, list):
+                    val = CommentedSeq(val)
+                onebot[key] = val
+
+
 def generate_config_yaml(config: VTuberConfig | None = None) -> str:
     """Generate a complete, commented config.yaml string from the Pydantic model."""
     ry = YAML()
@@ -136,6 +153,9 @@ def migrate_config() -> None:
                 user_data.yaml_set_comment_before_after_key(
                     key, before=comment, indent=0
                 )
+
+    # Backfill missing keys inside each provider section
+    _migrate_providers(user_data)
 
     user_data["config_version"] = CONFIG_VERSION
 
