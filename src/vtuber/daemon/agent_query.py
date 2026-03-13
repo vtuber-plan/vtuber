@@ -6,7 +6,7 @@ import logging
 import os
 import signal as signal_mod
 from dataclasses import dataclass
-from typing import AsyncIterator, Literal
+from typing import AsyncIterable, AsyncIterator, Literal
 
 from claude_agent_sdk import ClaudeSDKClient, query as sdk_query
 from claude_agent_sdk.types import (
@@ -213,6 +213,11 @@ async def collect_response(
 # ── One-shot (ephemeral) query streaming ──────────────────────────
 
 
+async def _as_async_iter(text: str) -> AsyncIterable[str]:
+    """Wrap a string prompt as an AsyncIterable for sdk_query streaming mode."""
+    yield text
+
+
 async def iter_oneshot(
     prompt: str,
     options: ClaudeAgentOptions,
@@ -220,7 +225,7 @@ async def iter_oneshot(
     log_source: str = "oneshot",
 ) -> AsyncIterator[AgentEvent]:
     """Run a one-shot query and yield typed events."""
-    async for msg in sdk_query(prompt=prompt, options=options):
+    async for msg in sdk_query(prompt=_as_async_iter(prompt), options=options):
         event = _process_stream_msg(msg, log_source)
         if event:
             yield event
@@ -257,7 +262,7 @@ async def extract_tool_call(
     )
 
     try:
-        async for msg in sdk_query(prompt=prompt, options=options):
+        async for msg in sdk_query(prompt=_as_async_iter(prompt), options=options):
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, ToolUseBlock) and block.name == tool_name:
