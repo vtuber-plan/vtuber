@@ -80,6 +80,10 @@ async def extract_message_text(
             url = data.get("url", "")
             filename = data.get("file", "")
             file_id = data.get("file_id", "")
+            logger.info(
+                "File segment: type=%s, file=%s, file_id=%s, url=%s, all_keys=%s",
+                seg_type, filename, file_id, url[:80] if url else "(empty)", list(data.keys()),
+            )
 
             # If no direct URL, try get_file API with file_id
             if not url and file_id:
@@ -160,29 +164,41 @@ async def _resolve_file_url(provider: OneBotProvider, file_id: str) -> str:
 
     Falls back to ``get_file`` if the private URL endpoint fails.
     """
+    logger.info("Resolving file_id=%s ...", file_id)
+
     # Try NapCat's get_private_file_url first (returns a direct download link)
     resp = await provider.send_onebot_action(
         "get_private_file_url", {"file_id": file_id}, wait=True, timeout=30.0,
     )
+    logger.info("get_private_file_url response: %s", resp)
     if resp and resp.get("status") == "ok":
         data = resp.get("data", {})
         url = data.get("url", "") or data.get("private_url", "")
         if url:
-            logger.debug("Resolved file_id=%s via get_private_file_url → %s", file_id, url[:80])
+            logger.info("Resolved file_id=%s via get_private_file_url → %s", file_id, url[:120])
             return url
+        logger.warning("get_private_file_url returned ok but no url in data: %s", data)
 
-    # Fallback: get_file may return a local path or base64
+    # Fallback: get_file may return a url or local path
     resp = await provider.send_onebot_action(
         "get_file", {"file_id": file_id}, wait=True, timeout=30.0,
     )
+    logger.info("get_file response: %s", resp)
     if resp and resp.get("status") == "ok":
         data = resp.get("data", {})
+        # Prefer url field; file field is typically a server-local path
         url = data.get("url", "")
         if url:
-            logger.debug("Resolved file_id=%s via get_file → %s", file_id, url[:80])
+            logger.info("Resolved file_id=%s via get_file url → %s", file_id, url[:120])
             return url
+        # Some impls put the path in 'file' — not directly usable for HTTP download
+        local = data.get("file", "")
+        if local:
+            logger.warning(
+                "get_file returned local path (not a URL) for file_id=%s: %s", file_id, local,
+            )
 
-    logger.warning("Failed to resolve file_id=%s: %s", file_id, resp)
+    logger.warning("Failed to resolve file_id=%s — no download URL obtained", file_id)
     return ""
 
 
