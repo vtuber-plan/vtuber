@@ -110,13 +110,7 @@ class NapCatProvider(Provider):
             case OnlineFileNoticeEvent():
                 await self._handle_file_upload(event)
             case _:
-                # napcat-sdk has no OfflineFileEvent; QQ private file transfers
-                # arrive as notice_type="offline_file" and fall through to
-                # UnknownNoticeEvent.  Handle them from _raw.
-                raw = event._raw
-                if raw.get("notice_type") == "offline_file":
-                    await self._handle_offline_file(raw)
-
+                pass
 
     # ── Private Messages ──────────────────────────────────────────
 
@@ -329,47 +323,6 @@ class NapCatProvider(Provider):
             session_id=session_id,
         )
         logger.info("File upload from %s: %s -> %s", nickname, filename, local_path)
-
-    async def _handle_offline_file(self, raw: dict) -> None:
-        """Handle offline_file notice (private file transfer, no typed SDK event)."""
-        from vtuber.providers.onebot.message import download_file
-
-        user_id = raw.get("user_id")
-        if not user_id:
-            return
-
-        is_owner = self._owner_id and str(user_id) == self._owner_id
-        if not is_owner and self._user_whitelist and str(user_id) not in self._user_whitelist:
-            return
-
-        file_info = raw.get("file", {})
-        url = file_info.get("url", "")
-        filename = file_info.get("name", "")
-        file_id = file_info.get("id", "") or file_info.get("file_id", "")
-
-        if not url and file_id:
-            url = await self._resolve_file_url(file_id)
-
-        if not url:
-            logger.warning("offline_file notice without downloadable URL: file_id=%s, raw=%s", file_id, raw)
-            return
-
-        local_path = await download_file(url, filename)
-        if not local_path:
-            logger.warning("Failed to download offline file: %s", filename)
-            return
-
-        nickname = str(user_id)
-        session_id = f"napcat:private:{user_id}"
-        self._pending[session_id] = _PendingResponse(reply_to="private", user_id=int(user_id))
-        await self.send_message(
-            f"[文件: {local_path}]",
-            sender=nickname,
-            is_owner=is_owner,
-            is_private=True,
-            session_id=session_id,
-        )
-        logger.info("Offline file from %s: %s -> %s", nickname, filename, local_path)
 
     # ── Message Text Extraction ───────────────────────────────────
 
