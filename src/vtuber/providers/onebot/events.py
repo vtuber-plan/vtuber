@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from .message import download_file, extract_message_text
+from .message import _resolve_file_url, download_file, extract_message_text
 
 if TYPE_CHECKING:
     from .provider import OneBotProvider
@@ -257,9 +257,14 @@ async def _handle_file_upload(
     file_info = event.get("file", {})
     url = file_info.get("url", "")
     filename = file_info.get("name", "")
+    file_id = file_info.get("id", "") or file_info.get("file_id", "")
+
+    # If no direct URL, try get_file API with file_id
+    if not url and file_id:
+        url = await _resolve_file_url(provider, file_id)
 
     if not url:
-        logger.warning("File upload notice without URL: %s", event)
+        logger.warning("File upload notice without URL (no file_id either): %s", event)
         return
 
     local_path = await download_file(url, filename)

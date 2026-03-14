@@ -79,6 +79,12 @@ async def extract_message_text(
         elif seg_type in ("file", "record") and is_private:
             url = data.get("url", "")
             filename = data.get("file", "")
+            file_id = data.get("file_id", "")
+
+            # If no direct URL, try get_file API with file_id
+            if not url and file_id:
+                url = await _resolve_file_url(provider, file_id)
+
             if url:
                 local_path = await download_file(url, filename)
                 if local_path:
@@ -86,6 +92,8 @@ async def extract_message_text(
                     parts.append(f"[{label}: {local_path}]")
                 else:
                     parts.append(f"[{seg_type}: 下载失败]")
+            elif filename:
+                parts.append(f"[{seg_type}: {filename} (无法获取下载链接)]")
 
         elif seg_type == "at":
             pass  # handled elsewhere for trigger detection
@@ -142,6 +150,24 @@ async def _fetch_forward_context(provider: OneBotProvider, forward_id: str) -> s
         if content:
             lines.append(f"{sender}: {content}")
     return "\n".join(lines) + "\n"
+
+
+# ── File URL resolution ────────────────────────────────────────────
+
+
+async def _resolve_file_url(provider: OneBotProvider, file_id: str) -> str:
+    """Resolve a file_id to a download URL via the ``get_file`` API."""
+    resp = await provider.send_onebot_action(
+        "get_file", {"file_id": file_id}, wait=True, timeout=10.0,
+    )
+    if resp and resp.get("status") == "ok":
+        data = resp.get("data", {})
+        url = data.get("url", "") or data.get("base64", "")
+        if url:
+            logger.debug("Resolved file_id=%s → url=%s", file_id, url[:80])
+            return url
+    logger.warning("Failed to resolve file_id=%s: %s", file_id, resp)
+    return ""
 
 
 # ── File download ──────────────────────────────────────────────────
