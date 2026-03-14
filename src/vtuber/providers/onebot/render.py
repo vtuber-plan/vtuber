@@ -18,8 +18,14 @@ _HTML_TEMPLATE = """\
     padding: 0;
     box-sizing: border-box;
 }}
-html, body {{
+html {{
     background: transparent;
+    height: fit-content;
+}}
+body {{
+    background: transparent;
+    display: inline-block;
+    width: 100%;
 }}
 .container {{
     font-family: -apple-system, "Noto Sans SC", "PingFang SC",
