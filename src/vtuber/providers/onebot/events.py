@@ -17,21 +17,9 @@ logger = logging.getLogger("vtuber.provider.onebot.events")
 async def handle_onebot_event(provider: OneBotProvider, event: dict) -> None:
     """Top-level dispatcher for incoming OneBot events.
 
-    Also routes echo-based API responses back to waiting futures.
+    Note: echo-based API responses are resolved in the read loop
+    (``_onebot_read_loop``) before reaching this function.
     """
-    # Route API responses by echo field (normalize to str — some impls return int)
-    echo = event.get("echo")
-    if echo is not None:
-        echo = str(echo)
-    if echo and echo in provider._api_futures:
-        future = provider._api_futures.pop(echo)
-        if not future.done():
-            try:
-                future.set_result(event)
-            except asyncio.InvalidStateError:
-                pass
-        return
-
     post_type = event.get("post_type")
     if post_type == "meta_event":
         await _handle_meta_event(provider, event)

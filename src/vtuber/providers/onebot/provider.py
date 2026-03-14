@@ -104,16 +104,36 @@ class OneBotProvider(Provider):
             return False
 
     async def _onebot_read_loop(self) -> None:
-        """Read events from OneBot WebSocket and dispatch them."""
+        """Read events from OneBot WebSocket and dispatch them.
+
+        Echo-based API responses are resolved inline so that event handlers
+        (which may themselves call ``send_onebot_action(wait=True)``) never
+        deadlock the read loop.  Regular events are dispatched as background
+        tasks so the loop keeps reading.
+        """
         try:
             async for raw in self._ws:
                 try:
                     event = json.loads(raw)
-                    await handle_onebot_event(self, event)
                 except json.JSONDecodeError:
                     logger.warning("Invalid JSON from OneBot: %s", raw[:200])
-                except Exception as e:
-                    logger.error("Error handling OneBot event: %s", e)
+                    continue
+
+                # Fast-path: resolve echo-correlated API responses immediately
+                echo = event.get("echo")
+                if echo is not None:
+                    echo = str(echo)
+                if echo and echo in self._api_futures:
+                    future = self._api_futures.pop(echo)
+                    if not future.done():
+                        try:
+                            future.set_result(event)
+                        except asyncio.InvalidStateError:
+                            pass
+                    continue
+
+                # Dispatch real events as tasks so the read loop stays free
+                asyncio.create_task(self._safe_handle_event(event))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -125,6 +145,13 @@ class OneBotProvider(Provider):
                 if not fut.done():
                     fut.cancel()
             self._api_futures.clear()
+
+    async def _safe_handle_event(self, event: dict) -> None:
+        """Dispatch an event with error isolation."""
+        try:
+            await handle_onebot_event(self, event)
+        except Exception as e:
+            logger.error("Error handling OneBot event: %s", e)
 
     async def _reconnect_loop(self) -> None:
         """Reconnect to OneBot WebSocket with exponential backoff."""
