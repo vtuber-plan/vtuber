@@ -28,14 +28,13 @@ DEFAULT_GROUP_ALLOWED_COMMANDS: list[str] = [
     # network / download
     "curl", "wget",
     # text processing
-    "cat", "head", "tail", "grep", "awk", "sed", "sort", "uniq", "wc", "tr", "cut",
+    "cat", "head", "tail", "grep", "sort", "uniq", "wc", "tr", "cut",
     # file inspection
-    "ls", "find", "file", "stat", "du", "df",
+    "file", "stat", "du", "df",
     # common utilities
     "echo", "date", "env", "which", "whoami", "uname", "pwd",
     # programming tools
-    "python", "python3", "pip", "pip3", "node", "npm", "npx",
-    "jq", "yq",
+    "npx", "jq", "yq",
 ]
 
 
