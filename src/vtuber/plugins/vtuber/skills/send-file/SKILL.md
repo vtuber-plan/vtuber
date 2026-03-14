@@ -1,38 +1,62 @@
 ---
 name: send-file
-description: Activate when you need to send files to the user. Triggers on file download requests, export requests, generated files that need delivery, or any scenario requiring local file transfer to the user.
+description: Send files to the user. Use this skill whenever the user asks to send, transfer, export, or deliver any file to them — regardless of whether they say "send file", "give me the file", "I need that document", or any similar request.
 ---
 
-# Sending Files to the User
+# File Transfer to User
 
-When you need to send one or more local files to the user, **do not** paste file paths inline or describe where the file is located.
+When the user needs to receive a local file, use the vtuber file transfer system to deliver it.
+
+## How It Works
+
+The vtuber system intercepts **pure JSON arrays** containing file paths and automatically transfers those files to the user. This is a system-level integration — the JSON output is parsed and handled specially, not displayed as regular text.
+
+## Critical Requirement
+
+**Your reply must contain ONLY the raw JSON array** — no markdown formatting, no explanatory text, no code blocks, no additional characters whatsoever.
+
+The system expects raw JSON like this:
+["/path/to/file.txt"]
+
+NOT this:
+```
+["/path/to/file.txt"]
+```
+
+NOT this:
+```
+Here's your file: ["/path/to/file.txt"]
+```
 
 ## Output Format
 
-Output the file paths as a **pure JSON array** where each element is an **absolute path** string:
+Output file paths as a **pure JSON array** with **absolute paths**:
 
-```
-["/absolute/path/to/file1.txt", "/absolute/path/to/file2.pdf"]
-```
+**Single file:**
+["/home/agent/.vtuber/workspace/report.pdf"]
 
-## Rules
+**Multiple files:**
+["/home/agent/.vtuber/workspace/chart1.png", "/home/agent/.vtuber/workspace/chart2.png", "/home/agent/.vtuber/workspace/data.csv"]
 
-1. Your reply **must contain only** this JSON array — no additional text, explanation, or markdown formatting.
-2. All paths must be **absolute** (starting with `/`).
-3. Ensure the file already exists at the specified path.
-4. Supported file types: `.pdf`, `.md`, `.markdown`, `.txt`, `.ppt`, `.pptx`, `.doc`, `.docx`, `.wav`, `.mp3`, `.jpg`, `.jpeg`, `.gif`, `.png`
-5. Even for a single file, use the array format: `["/path/to/file.txt"]`
+## Requirements
+
+1. **Pure JSON only** — No markdown, no text, no code blocks, no explanations
+2. **Absolute paths only** — Must start with `/`
+3. **Verify files exist** — Ensure file is at the specified path before outputting
+4. **Always use array format** — Even for single files: `["/path"]`
+5. **Supported file types** — `.pdf`, `.md`, `.markdown`, `.txt`, `.ppt`, `.pptx`, `.doc`, `.docx`, `.wav`, `.mp3`, `.jpg`, `.jpeg`, `.gif`, `.png`, and many others
 
 ## Examples
 
-User asks "send me the report" — after generating the report file, reply with:
+User: "Send me the report"
+Reply: ["/home/agent/.vtuber/workspace/Downloads/report.pdf"]
 
-```
-["/home/agent/.vtuber/workspace/Downloads/report.pdf"]
-```
+User: "I need those two charts"
+Reply: ["/home/agent/.vtuber/workspace/Downloads/chart1.png", "/home/agent/.vtuber/workspace/Downloads/chart2.png"]
 
-User asks "send me those two images":
+User: "Can you download and send me the data?"
+(You download the file to `/home/agent/.vtuber/workspace/Downloads/data.csv`), then output:
+["/home/agent/.vtuber/workspace/Downloads/data.csv"]
 
-```
-["/home/agent/.vtuber/workspace/Downloads/chart1.png", "/home/agent/.vtuber/workspace/Downloads/chart2.png"]
-```
+
+Any extra text (including markdown code blocks) breaks this detection and the files won't transfer properly.

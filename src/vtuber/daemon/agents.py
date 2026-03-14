@@ -209,6 +209,13 @@ class AgentPool:
         )
         return agent
 
+    async def reset_context(self, session_id: str) -> None:
+        """Reset an agent's conversation context by disconnecting and reconnecting."""
+        if agent := self._agents.get(session_id):
+            await safe_disconnect(agent)
+            await agent.connect()
+            logger.info("Reset context for session %s", session_id)
+
     async def remove(self, session_id: str) -> None:
         """Remove and disconnect a specific agent."""
         if agent := self._agents.pop(session_id, None):
