@@ -8,7 +8,7 @@ from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk.types import AgentDefinition, ClaudeAgentOptions
 
 from vtuber.config import ensure_workspace_dir, get_config, get_persona_path, get_user_path, get_plugins_dir
-from vtuber.permissions import agent_permission_handler
+from vtuber.permissions import agent_permission_handler, group_permission_handler
 from vtuber.persona import build_system_prompt
 
 logger = logging.getLogger("vtuber.daemon")
@@ -50,6 +50,7 @@ def build_agent_options(
     include_preset_tools: bool = False,
     session_persistence: bool = False,
     resume: bool = False,
+    permission_handler=None,
 ) -> ClaudeAgentOptions:
     """Build ClaudeAgentOptions for use with create_agent() or sdk query().
 
@@ -62,6 +63,7 @@ def build_agent_options(
         include_preset_tools: Include Claude Code preset tools.
         session_persistence: Allow Claude session persistence (default: disabled).
         resume: Resume an existing agent session.
+        permission_handler: Custom permission handler. Defaults to agent_permission_handler.
     """
     if system_prompt is None:
         system_prompt = build_system_prompt(get_persona_path(), get_user_path())
@@ -71,7 +73,7 @@ def build_agent_options(
     options_kwargs: dict = {
         "system_prompt": system_prompt,
         "permission_mode": "bypassPermissions",
-        "can_use_tool": agent_permission_handler,
+        "can_use_tool": permission_handler or agent_permission_handler,
         "cli_path": get_config().cli_path,
         "cwd": str(ensure_workspace_dir()),
     }

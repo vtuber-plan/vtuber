@@ -26,6 +26,7 @@ from vtuber.config import (
     reset_config,
 )
 from vtuber.daemon.agents import AgentPool, build_agent_options, safe_disconnect
+from vtuber.permissions import group_permission_handler
 from vtuber.daemon.gateway import Gateway, ProviderConnection
 from vtuber.daemon.heartbeat import HeartbeatManager
 from vtuber.daemon.protocol import MessageType, decode_message, encode_message
@@ -452,11 +453,12 @@ class DaemonServer:
         group_instruction = GROUP_INSTRUCTION.format(owner_name=owner_name)
 
         # One-shot query — no persistent agent needed for group chat
-        # Security: only the owner gets preset tools (Bash, Read, Write…).
-        # Other group members get conversational + MCP tools only.
+        # Security: group chat uses restricted permission handler that
+        # blocks file writes and only allows whitelisted Bash commands.
         options = build_agent_options(
             prompt_suffix=group_instruction,
-            include_preset_tools=is_owner,
+            include_preset_tools=True,
+            permission_handler=group_permission_handler,
         )
         await self._run_oneshot_query(
             query_text, options, provider_id, session_id, log_source,

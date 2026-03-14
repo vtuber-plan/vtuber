@@ -79,6 +79,10 @@ class VTuberConfig(BaseModel):
         default_factory=lambda: ["~/.vtuber"],
         description="Agent 允许写入的目录列表",
     )
+    group_allowed_commands: list[str] | None = Field(
+        default=None,
+        description="群聊 Bash 命令白名单（为 null 时使用内置默认白名单）",
+    )
     max_agents: int = Field(
         default=10,
         ge=1,
