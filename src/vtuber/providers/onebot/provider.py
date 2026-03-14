@@ -343,7 +343,10 @@ class OneBotProvider(Provider):
 
         for m in self._FILE_PATH_RE.finditer(text):
             raw = m.group()
-            p = Path(raw).expanduser()
+            try:
+                p = Path(raw).expanduser()
+            except RuntimeError:
+                p = Path(raw)
             if p.is_file() and p.suffix.lower() in self._SENDABLE_EXTENSIONS:
                 found.append(p)
                 spans_to_remove.append(m.span())
