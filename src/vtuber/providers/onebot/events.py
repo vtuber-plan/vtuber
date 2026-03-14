@@ -19,8 +19,10 @@ async def handle_onebot_event(provider: OneBotProvider, event: dict) -> None:
 
     Also routes echo-based API responses back to waiting futures.
     """
-    # Route API responses by echo field
+    # Route API responses by echo field (normalize to str — some impls return int)
     echo = event.get("echo")
+    if echo is not None:
+        echo = str(echo)
     if echo and echo in provider._api_futures:
         future = provider._api_futures.pop(echo)
         if not future.done():

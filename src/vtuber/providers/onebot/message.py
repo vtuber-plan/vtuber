@@ -156,16 +156,32 @@ async def _fetch_forward_context(provider: OneBotProvider, forward_id: str) -> s
 
 
 async def _resolve_file_url(provider: OneBotProvider, file_id: str) -> str:
-    """Resolve a file_id to a download URL via the ``get_file`` API."""
+    """Resolve a file_id to a download URL via NapCat's ``get_private_file_url``.
+
+    Falls back to ``get_file`` if the private URL endpoint fails.
+    """
+    # Try NapCat's get_private_file_url first (returns a direct download link)
     resp = await provider.send_onebot_action(
-        "get_file", {"file_id": file_id}, wait=True, timeout=10.0,
+        "get_private_file_url", {"file_id": file_id}, wait=True, timeout=30.0,
     )
     if resp and resp.get("status") == "ok":
         data = resp.get("data", {})
-        url = data.get("url", "") or data.get("base64", "")
+        url = data.get("url", "") or data.get("private_url", "")
         if url:
-            logger.debug("Resolved file_id=%s → url=%s", file_id, url[:80])
+            logger.debug("Resolved file_id=%s via get_private_file_url → %s", file_id, url[:80])
             return url
+
+    # Fallback: get_file may return a local path or base64
+    resp = await provider.send_onebot_action(
+        "get_file", {"file_id": file_id}, wait=True, timeout=30.0,
+    )
+    if resp and resp.get("status") == "ok":
+        data = resp.get("data", {})
+        url = data.get("url", "")
+        if url:
+            logger.debug("Resolved file_id=%s via get_file → %s", file_id, url[:80])
+            return url
+
     logger.warning("Failed to resolve file_id=%s: %s", file_id, resp)
     return ""
 
