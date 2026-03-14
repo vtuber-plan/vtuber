@@ -19,6 +19,7 @@ dependencies = [
     "trafilatura>=2.0.0",
     "websockets>=13.0",
     "markdown>=3.5.0",
+    "napcat-sdk>=0.6.8",
 ]
 
 [build-system]
@@ -36,3 +37,4 @@ vtuber = "vtuber.main:main"
 vtuber-daemon = "vtuber.daemon.server:main"
 vtuber-cli = "vtuber.providers.cli:main"
 vtuber-onebot = "vtuber.providers.onebot:main"
+vtuber-napcat = "vtuber.providers.napcat:main"

@@ -14,7 +14,7 @@ from vtuber.config import get_config
 from vtuber.providers.base import Provider
 
 from .events import handle_onebot_event
-from .render import render_text_as_image, should_render_as_image
+from vtuber.providers.render import render_text_as_image, should_render_as_image
 
 logger = logging.getLogger("vtuber.provider.onebot")
 console = Console()
@@ -286,8 +286,10 @@ class OneBotProvider(Provider):
         ".jpg", ".jpeg", ".gif", ".png",
     ))
 
-    # Match absolute paths like /home/user/file.txt or ~/file.txt
-    _FILE_PATH_RE = re.compile(r"(?:~|/)[^\s\]\)]+")
+    # Match absolute paths like /home/user/file.txt or ~/file.txt.
+    # Use a whitelist of path-safe characters to avoid capturing Chinese
+    # punctuation or other non-path Unicode that often follows paths in text.
+    _FILE_PATH_RE = re.compile(r"(?:~|/)[A-Za-z0-9_./@:~-]+(?:/[A-Za-z0-9_./@:~-]+)*")
 
     async def _send_reply(self, pending: _PendingResponse, text: str) -> None:
         """Send a reply through OneBot, rendering as image if needed.
@@ -368,7 +370,7 @@ class OneBotProvider(Provider):
             "upload_private_file",
             {
                 "user_id": user_id,
-                "file": str(path),
+                "file": "file://" + str(path),
                 "name": path.name,
             },
             wait=True,

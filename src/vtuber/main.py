@@ -63,6 +63,7 @@ USAGE = """\
   [green]chat[/green]         连接 daemon 开始对话
   [green]mock-group[/green]   模拟群聊测试
   [green]onebot[/green]       连接 OneBot v11 实现
+  [green]napcat[/green]       连接 NapCat（napcat-sdk）
   [green]restart[/green]      重启 daemon
   [green]reload[/green]       热重载提示词（无需重启）
 """
@@ -94,6 +95,9 @@ def main():
     elif command == "onebot":
         from vtuber.providers.onebot import main as onebot_main
         onebot_main()
+    elif command == "napcat":
+        from vtuber.providers.napcat import main as napcat_main
+        napcat_main()
     elif command == "restart":
         from vtuber.daemon.cli import stop_daemon, start_daemon_background
         stop_daemon()
