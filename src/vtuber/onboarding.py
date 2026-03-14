@@ -262,14 +262,14 @@ def create_default_configs():
                 if not target.exists() and skill_md.exists():
                     shutil.copy2(skill_md, target)
 
-    # Release built-in plugins to ~/.vtuber/plugins/
+
+    # Copy template plugins (e.g. custom) to user plugins dir
     builtin_plugins = Path(__file__).parent / "plugins"
     plugins_dir = ensure_plugins_dir()
-    if builtin_plugins.is_dir():
-        for plugin_dir in builtin_plugins.iterdir():
-            if plugin_dir.is_dir() and not plugin_dir.name.startswith(("_", ".")):
-                target = plugins_dir / plugin_dir.name
-                if not target.exists():
-                    shutil.copytree(plugin_dir, target)
+    for template_name in ("custom",):
+        src = builtin_plugins / template_name
+        target = plugins_dir / template_name
+        if src.is_dir() and not target.exists():
+            shutil.copytree(src, target)
 
     migrate_config()

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from collections import OrderedDict
+from pathlib import Path
 
 from claude_agent_sdk import ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk.types import AgentDefinition, ClaudeAgentOptions
@@ -78,16 +79,29 @@ def build_agent_options(
         "cwd": str(ensure_workspace_dir()),
     }
 
-    # Load plugins from ~/.vtuber/plugins/
-    plugins_dir = get_plugins_dir()
-    if plugins_dir.is_dir():
-        plugin_configs = [
-            {"type": "local", "path": str(p)}
-            for p in sorted(plugins_dir.iterdir())
-            if p.is_dir() and not p.name.startswith(("_", "."))
+    # Load plugins: built-in first, then user plugins (user overrides built-in by name)
+    # Template dirs (e.g. "custom") are excluded from built-in loading;
+    # they are copied to the user directory during onboarding instead.
+    _TEMPLATE_PLUGINS = {"custom"}
+    builtin_plugins_dir = Path(__file__).parent.parent / "plugins"
+    user_plugins_dir = get_plugins_dir()
+
+    plugins_by_name: dict[str, str] = {}
+    if builtin_plugins_dir.is_dir():
+        for p in sorted(builtin_plugins_dir.iterdir()):
+            if p.is_dir() and not p.name.startswith(("_", ".")) and p.name not in _TEMPLATE_PLUGINS:
+                plugins_by_name[p.name] = str(p)
+    if user_plugins_dir.is_dir():
+        for p in sorted(user_plugins_dir.iterdir()):
+            if p.is_dir() and not p.name.startswith(("_", ".")):
+                plugins_by_name[p.name] = str(p)
+
+    if plugins_by_name:
+        options_kwargs["plugins"] = [
+            {"type": "local", "path": path}
+            for path in plugins_by_name.values()
         ]
-        if plugin_configs:
-            options_kwargs["plugins"] = plugin_configs
+        logger.debug(f'Load plugins: {options_kwargs["plugins"]}')
 
     if include_preset_system_prompt:
         options_kwargs['system_prompt'] = {
