@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +11,7 @@ from rich.console import Console
 
 from vtuber.config import get_config
 from vtuber.providers.base import Provider
+from vtuber.providers.files import parse_file_reply
 
 from .events import handle_onebot_event
 from vtuber.providers.render import render_text_as_image, should_render_as_image
@@ -278,34 +278,16 @@ class OneBotProvider(Provider):
 
     # ── Reply Helper ──────────────────────────────────────────────
 
-    # File extensions that should be sent as file uploads in private chat
-    _SENDABLE_EXTENSIONS = frozenset((
-        ".pdf", ".markdown", ".md", ".txt",
-        ".ppt", ".pptx", ".doc", ".docx",
-        ".wav", ".mp3",
-        ".jpg", ".jpeg", ".gif", ".png",
-    ))
-
-    # Match absolute paths like /home/user/file.txt or ~/file.txt.
-    # Use a whitelist of path-safe characters to avoid capturing Chinese
-    # punctuation or other non-path Unicode that often follows paths in text.
-    _FILE_PATH_RE = re.compile(r"(?:~|/)[A-Za-z0-9_./@:~-]+(?:/[A-Za-z0-9_./@:~-]+)*")
-
     async def _send_reply(self, pending: _PendingResponse, text: str) -> None:
-        """Send a reply through OneBot, rendering as image if needed.
-
-        For private messages, file paths with supported extensions are
-        extracted and sent as file uploads via ``upload_private_file``.
-        """
-        # In private chat, detect and send file paths as file uploads
+        """Send a reply through OneBot, rendering as image if needed."""
+        # In private chat, if the entire reply is a JSON array of absolute paths,
+        # send them as file uploads instead of text.
         if pending.reply_to == "private" and pending.user_id:
-            file_paths, remaining_text = self._extract_file_paths(text)
-            for fp in file_paths:
-                await self._upload_private_file(pending.user_id, fp)
-            text = remaining_text
-
-        if not text:
-            return
+            file_paths = parse_file_reply(text)
+            if file_paths:
+                for fp in file_paths:
+                    await self._upload_private_file(pending.user_id, fp)
+                return
 
         message: str | list[dict] = text
 
@@ -334,35 +316,6 @@ class OneBotProvider(Provider):
                 "group_id": pending.group_id,
                 "message": message,
             })
-
-    def _extract_file_paths(self, text: str) -> tuple[list[Path], str]:
-        """Extract valid sendable file paths from text.
-
-        Returns (list_of_paths, remaining_text_with_paths_removed).
-        """
-        found: list[Path] = []
-        spans_to_remove: list[tuple[int, int]] = []
-
-        for m in self._FILE_PATH_RE.finditer(text):
-            raw = m.group()
-            try:
-                p = Path(raw).expanduser()
-            except RuntimeError:
-                p = Path(raw)
-            if p.is_file() and p.suffix.lower() in self._SENDABLE_EXTENSIONS:
-                found.append(p)
-                spans_to_remove.append(m.span())
-
-        if not spans_to_remove:
-            return [], text
-
-        # Remove matched paths from text (reverse order to preserve indices)
-        parts = list(text)
-        for start, end in reversed(spans_to_remove):
-            parts[start:end] = []
-        remaining = "".join(parts).strip()
-
-        return found, remaining
 
     async def _upload_private_file(self, user_id: int, path: Path) -> None:
         """Upload a file to a private chat via upload_private_file API."""

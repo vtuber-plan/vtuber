@@ -1,8 +1,10 @@
 """NapCat provider — connects to NapCat via napcat-sdk typed client."""
 
 import asyncio
+import base64
+import hashlib
 import logging
-import re
+import uuid
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -30,6 +32,7 @@ from napcat import (
 
 from vtuber.config import get_config
 from vtuber.providers.base import Provider
+from vtuber.providers.files import parse_file_reply
 from vtuber.providers.render import render_text_as_image, should_render_as_image
 
 logger = logging.getLogger("vtuber.provider.napcat")
@@ -487,29 +490,19 @@ class NapCatProvider(Provider):
 
     # ── Reply Helper ──────────────────────────────────────────────
 
-    _SENDABLE_EXTENSIONS = frozenset((
-        ".pdf", ".markdown", ".md", ".txt",
-        ".ppt", ".pptx", ".doc", ".docx",
-        ".wav", ".mp3",
-        ".jpg", ".jpeg", ".gif", ".png",
-    ))
-
-    _FILE_PATH_RE = re.compile(r"(?:~|/)[A-Za-z0-9_./@:~-]+(?:/[A-Za-z0-9_./@:~-]+)*")
-
     async def _send_reply(self, pending: _PendingResponse, text: str) -> None:
         """Send a reply, rendering as image if needed."""
         if not self._client:
             return
 
-        # In private chat, detect and send file paths as file uploads
+        # In private chat, if the entire reply is a JSON array of absolute paths,
+        # send them as file uploads instead of text.
         if pending.reply_to == "private" and pending.user_id:
-            file_paths, remaining = self._extract_file_paths(text)
-            for fp in file_paths:
-                await self._upload_private_file(pending.user_id, fp)
-            text = remaining
-
-        if not text:
-            return
+            file_paths = parse_file_reply(text)
+            if file_paths:
+                for fp in file_paths:
+                    await self._upload_private_file(pending.user_id, fp)
+                return
 
         message: str | list[dict] = text
 
@@ -534,42 +527,74 @@ class NapCatProvider(Provider):
                 message=message,
             )
 
-    def _extract_file_paths(self, text: str) -> tuple[list[Path], str]:
-        """Extract valid sendable file paths from text."""
-        found: list[Path] = []
-        spans_to_remove: list[tuple[int, int]] = []
-
-        for m in self._FILE_PATH_RE.finditer(text):
-            raw = m.group()
-            try:
-                p = Path(raw).expanduser()
-            except RuntimeError:
-                p = Path(raw)
-            if p.is_file() and p.suffix.lower() in self._SENDABLE_EXTENSIONS:
-                found.append(p)
-                spans_to_remove.append(m.span())
-
-        if not spans_to_remove:
-            return [], text
-
-        parts = list(text)
-        for start, end in reversed(spans_to_remove):
-            parts[start:end] = []
-        remaining = "".join(parts).strip()
-
-        return found, remaining
-
     async def _upload_private_file(self, user_id: int, path: Path) -> None:
-        """Upload a file to a private chat."""
+        """Upload a file to a private chat via streaming upload.
+
+        Reads the file locally, uploads it in base64 chunks via
+        ``upload_file_stream``, then sends the resulting server-side path
+        via ``upload_private_file``.
+        """
         if not self._client:
             return
+
+        CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
+
         try:
-            await self._client.upload_private_file(
-                user_id=str(user_id),
-                file="file://" + str(path),
-                name=path.name,
+            data = path.read_bytes()
+            file_size = len(data)
+            sha256 = hashlib.sha256(data).hexdigest()
+            stream_id = uuid.uuid4().hex
+
+            # Split into base64-encoded chunks
+            total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+            if total_chunks == 0:
+                total_chunks = 1
+
+            for i in range(total_chunks):
+                chunk = data[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
+                b64_chunk = base64.b64encode(chunk).decode("ascii")
+                await self._client.upload_file_stream(
+                    stream_id=stream_id,
+                    chunk_data=b64_chunk,
+                    chunk_index=i,
+                    total_chunks=total_chunks,
+                    file_size=file_size,
+                    expected_sha256=sha256,
+                    filename=path.name,
+                )
+
+            # Signal completion and get server-side file path
+            resp = await self._client.upload_file_stream(
+                stream_id=stream_id,
+                is_complete=True,
+                file_size=file_size,
+                expected_sha256=sha256,
+                filename=path.name,
             )
+
+            # Extract server-side path from response
+            server_path = ""
+            if isinstance(resp, dict):
+                server_path = resp.get("file_path", "") or resp.get("path", "")
+
+            if server_path:
+                await self._client.upload_private_file(
+                    user_id=str(user_id),
+                    file=server_path,
+                    name=path.name,
+                )
+            else:
+                logger.warning(
+                    "Stream upload returned no server path for %s: %s",
+                    path.name, resp,
+                )
+                return
+
             logger.info("Uploaded file to user %s: %s", user_id, path.name)
+            try:
+                await self._client.clean_stream_temp_file()
+            except Exception as e:
+                logger.debug("Failed to clean stream temp file: %s", e)
         except Exception as e:
             logger.warning("Failed to upload file %s to user %s: %s", path.name, user_id, e)
 
