@@ -14,6 +14,7 @@ from rich.console import Console
 
 from napcat import (
     At,
+    File,
     Forward,
     FriendPokeEvent,
     GroupMessageEvent,
@@ -292,26 +293,18 @@ class NapCatProvider(Provider):
         if not is_owner and self._user_whitelist and str(user_id) not in self._user_whitelist:
             return
 
-        # OnlineFileNoticeEvent has limited info; try raw dict for file details
-        raw = event._raw if hasattr(event, "_raw") else {}
+        # Extract file info from raw event data
+        raw = event._raw
         file_info = raw.get("file", {})
         url = file_info.get("url", "")
         filename = file_info.get("name", "")
         file_id = file_info.get("id", "") or file_info.get("file_id", "")
 
-        if not url and file_id and self._client:
-            try:
-                resp = await self._client.get_private_file_url(file_id=file_id)
-                url = getattr(resp, "url", "") or getattr(resp, "private_url", "")
-            except Exception:
-                try:
-                    resp = await self._client.get_file(file_id=file_id)
-                    url = getattr(resp, "url", "")
-                except Exception:
-                    pass
+        if not url and file_id:
+            url = await self._resolve_file_url(file_id)
 
         if not url:
-            logger.warning("File upload notice without URL: %s", raw)
+            logger.warning("File upload notice without downloadable URL: file_id=%s, raw=%s", file_id, raw)
             return
 
         local_path = await download_file(url, filename)
@@ -358,23 +351,31 @@ class NapCatProvider(Provider):
                     if ctx:
                         parts.append(ctx)
 
-                case Record(url=url, file=filename) if is_private and url:
-                    local_path = await download_file(url, filename or "")
-                    if local_path:
-                        parts.append(f"[语音: {local_path}]")
-                    else:
-                        parts.append("[语音: 下载失败]")
-
-                case _ if is_private and hasattr(seg, "url") and hasattr(seg, "file"):
-                    # Generic file-like segment (File, etc.)
-                    url = getattr(seg, "url", "")
-                    filename = getattr(seg, "file", "")
+                case Record(file=file_field) if is_private:
+                    url = getattr(seg, "url", "") or ""
+                    if not url and file_field:
+                        url = await self._resolve_file_url(file_field)
                     if url:
-                        local_path = await download_file(url, filename or "")
+                        local_path = await download_file(url, getattr(seg, "name", "") or file_field or "")
+                        if local_path:
+                            parts.append(f"[语音: {local_path}]")
+                        else:
+                            parts.append("[语音: 下载失败]")
+                    else:
+                        parts.append(f"[语音: {file_field} (无法获取下载链接)]")
+
+                case File(file=file_field) if is_private:
+                    url = getattr(seg, "url", "") or ""
+                    if not url and file_field:
+                        url = await self._resolve_file_url(file_field)
+                    if url:
+                        local_path = await download_file(url, getattr(seg, "name", "") or file_field or "")
                         if local_path:
                             parts.append(f"[文件: {local_path}]")
                         else:
                             parts.append("[文件: 下载失败]")
+                    else:
+                        parts.append(f"[文件: {file_field} (无法获取下载链接)]")
 
                 case At():
                     pass  # handled by _check_mention
@@ -430,6 +431,47 @@ class NapCatProvider(Provider):
         except Exception as e:
             logger.debug("Failed to fetch forward context: %s", e)
             return None
+
+    # ── File URL Resolution ────────────────────────────────────────
+
+    async def _resolve_file_url(self, file_id: str) -> str:
+        """Resolve a file_id to a download URL via NapCat API.
+
+        Tries ``get_private_file_url`` first, falls back to ``get_file``.
+        """
+        if not self._client:
+            return ""
+
+        # Try get_private_file_url first
+        try:
+            resp = await self._client.get_private_file_url(file_id=file_id)
+            url = ""
+            if isinstance(resp, dict):
+                url = resp.get("url", "") or resp.get("private_url", "")
+            else:
+                url = getattr(resp, "url", "") or getattr(resp, "private_url", "")
+            if url:
+                logger.info("Resolved file_id=%s via get_private_file_url", file_id)
+                return url
+        except Exception as e:
+            logger.debug("get_private_file_url failed for %s: %s", file_id, e)
+
+        # Fallback: get_file
+        try:
+            resp = await self._client.get_file(file_id=file_id)
+            url = ""
+            if isinstance(resp, dict):
+                url = resp.get("url", "")
+            else:
+                url = getattr(resp, "url", "")
+            if url:
+                logger.info("Resolved file_id=%s via get_file", file_id)
+                return url
+        except Exception as e:
+            logger.debug("get_file failed for %s: %s", file_id, e)
+
+        logger.warning("Failed to resolve file_id=%s — no download URL obtained", file_id)
+        return ""
 
     # ── Daemon Message Dispatch ───────────────────────────────────
 
